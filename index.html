@@ -1,0 +1,1737 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Chicken Yard</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #c { display: block; position: fixed; inset: 0; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* =========================================================================
+   CHICKEN YARD — a toddler toy. No goals, no score, no fail state.
+   Single file. No external requests. Vector art + Web Audio only.
+   ========================================================================= */
+
+/* -------------------------------------------------------------------------
+   CONFIG — every tunable number lives here. Retune the toy from this block.
+   ------------------------------------------------------------------------- */
+const CONFIG = {
+  W: 1280,                 // logical render width (letterboxed to fit)
+  H: 720,                  // logical render height
+  fixedStep: 1/60,         // physics timestep in seconds (frame-rate independent)
+  maxFrameDt: 0.1,         // clamp big frame gaps (tab wakeups) to avoid spiral
+
+  henCount: 12,            // number of full-size hens
+  chickCount: 3,           // number of small chicks
+  duckCount: 3,            // number of ducks
+
+  birdScaleJitter: 0.12,   // per-bird size variation (+/- fraction) so none look cloned
+  depthScaleBack: 0.85,    // sprite scale at the very back of the yard
+  depthScaleFront: 1.15,   // sprite scale at the very front of the yard
+
+  walkSpeed: 42,           // normal wander speed (logical px/sec)
+  runSpeed: 120,           // RUN_TO_FEED speed (logical px/sec)
+  duckSpeed: 34,           // duck waddle speed
+  chickFollowLag: 46,      // how far behind its hen a chick trails (px)
+
+  peckMinDips: 2,          // fewest head-dips in a PECK bout
+  peckMaxDips: 5,          // most head-dips in a PECK bout
+  peckInterval: 0.34,      // seconds between head dips
+
+  blinkMin: 3, blinkMax: 8,// seconds between blinks
+
+  feedScatterMin: 8,       // fewest kernels from a ground tap
+  feedScatterMax: 14,      // most kernels from a ground tap
+  feedScatterRadius: 70,   // spread radius of a scatter (px)
+  feedAttractRadius: 520,  // birds within this of a kernel will run to feed (px)
+  feedEatRadius: 26,       // bird eats a kernel within this distance (px)
+  dragFeedSpacing: 46,     // min finger travel between dropped trail kernels (px)
+
+  eggMax: 8,               // eggs kept in the nest box before oldest fades out
+  autoLayMin: 45,          // fewest seconds between a hen laying an egg on her own
+  autoLayMax: 75,          // most seconds between a hen laying an egg on her own
+  touchRadius: 90,         // logical hit radius for tapping a bird (generous)
+
+  masterVolume: 0.5,       // overall loudness (0..1)
+  maxVoices: 8,            // hard cap on simultaneous synth voices
+  ambientMin: 4, ambientMax: 10, // seconds between offscreen ambient clucks
+
+  particleCap: 200,        // hard cap on pooled dust puffs
+
+  // Palette — used exactly, never substituted with default web colors.
+  col: {
+    skyTop:   "#7EC8E3", skyLow:  "#CDE9F5",
+    mountains:"#8FA3B8", grass:   "#7FA65C",
+    dirt:     "#C8A97E", dirtDark:"#A98A62",
+    coopWood: "#B4602F", coopRoof:"#6E4327",
+    lumber:   "#D3B183", mesh:    "#9A9A94", meshAlpha: 0.35,
+    straw:    "#E8CE8A", water:   "#6BB8D6",
+    whiteHen: "#F6F3EC", redHen:  "#B5502E",
+    barredHen:"#4A4A4A", buffHen: "#E0A85C",
+    comb:     "#D6403A", beakLeg: "#E8A33D",
+    egg:      "#F3E4C8",
+  },
+};
+
+/* -------------------------------------------------------------------------
+   Yard geometry (in logical space). Defines where birds may roam and where
+   the interactive props sit.
+   ------------------------------------------------------------------------- */
+const YARD = {
+  horizonY: 320,          // sky ends / mountains sit near here
+  grassY:   400,          // grass field band
+  groundY:  430,          // dirt run floor begins
+  walkBack: 462,          // back edge of the walkable band (smaller y)
+  walkFront:702,          // front edge of the walkable band (larger y)
+  walkMinX: 46,
+  walkMaxX: 1236,
+  coop:   { x: 70,  y: 250, w: 250, h: 250 },     // coop building box (base at y+h)
+  nest:   { x: 320, y: 392, w: 118, h: 96 },      // external nest box on coop's side
+  trough: { x: 1058, y: 636, w: 176, h: 52 },     // water trough footprint
+  dust:   { cx: 660, cy: 668, rx: 108, ry: 34 },  // dust-bath depression
+};
+
+/* -------------------------------------------------------------------------
+   Canvas + letterbox transform
+   ------------------------------------------------------------------------- */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let view = { scale: 1, offX: 0, offY: 0, dpr: 1 };
+
+function fit() {
+  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+  const cw = window.innerWidth, ch = window.innerHeight;
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  canvas.style.width = cw + "px";
+  canvas.style.height = ch + "px";
+  const scale = Math.min(cw / CONFIG.W, ch / CONFIG.H);
+  view.dpr = dpr;
+  view.scale = scale;
+  view.offX = (cw - CONFIG.W * scale) / 2;
+  view.offY = (ch - CONFIG.H * scale) / 2;
+}
+window.addEventListener("resize", fit);
+window.addEventListener("orientationchange", fit);
+fit();
+
+// Screen (client) -> logical coordinates.
+function toLogical(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (clientX - rect.left - view.offX) / view.scale;
+  const y = (clientY - rect.top  - view.offY) / view.scale;
+  return { x, y };
+}
+
+/* -------------------------------------------------------------------------
+   Tiny deterministic helpers
+   ------------------------------------------------------------------------- */
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const TAU = Math.PI * 2;
+// ease helpers for non-snapping transitions
+const easeInOut = t => t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2, 2)/2;
+const easeOut = t => 1 - (1 - t) * (1 - t);
+
+/* =========================================================================
+   AUDIO — all synthesized. Master gain + gentle lowpass bus. Voice-capped.
+   ========================================================================= */
+const Audio = (() => {
+  let ac = null, bus = null, master = null, noiseBuf = null;
+  let voices = 0;
+  let ready = false;
+
+  function unlock() {
+    if (ac) { if (ac.state === "suspended") ac.resume(); return; }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ac = new AC();
+      master = ac.createGain();
+      master.gain.value = CONFIG.masterVolume;
+      bus = ac.createBiquadFilter();     // gentle lowpass so tablet speakers aren't harsh
+      bus.type = "lowpass";
+      bus.frequency.value = 5200;
+      bus.Q.value = 0.3;
+      bus.connect(master);
+      master.connect(ac.destination);
+      // pre-bake a short noise buffer for clicks/splashes
+      const len = ac.sampleRate * 1.0;
+      noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      ready = true;
+    } catch (e) { ready = false; }
+    if (ac && ac.state === "suspended") ac.resume();
+  }
+
+  // acquire a per-voice gain if we're under the cap; returns null if maxed out
+  function voiceGain(dur) {
+    if (!ready || voices >= CONFIG.maxVoices) return null;
+    voices++;
+    const g = ac.createGain();
+    g.connect(bus);
+    // release the voice slot shortly after the sound is scheduled to finish
+    const t = ac.currentTime + dur + 0.05;
+    const rel = () => { voices = Math.max(0, voices - 1); };
+    setTimeout(rel, (dur + 0.12) * 1000);
+    return g;
+  }
+
+  function noiseSource() {
+    const s = ac.createBufferSource();
+    s.buffer = noiseBuf;
+    s.loop = true;
+    return s;
+  }
+
+  // Cluck: sine glide 700->400Hz + short filtered noise burst; pitch jitter.
+  function cluck(vol) {
+    const g = voiceGain(0.16); if (!g) return;
+    const t = ac.currentTime;
+    const jitter = rand(0.85, 1.15);
+    const o = ac.createOsc ? ac.createOsc() : ac.createOscillator();
+    o.type = "sine";
+    o.frequency.setValueAtTime(700 * jitter, t);
+    o.frequency.exponentialRampToValueAtTime(400 * jitter, t + 0.12);
+    const og = ac.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.exponentialRampToValueAtTime((vol||0.5), t + 0.012);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.13);
+    o.connect(og); og.connect(g);
+    o.start(t); o.stop(t + 0.16);
+    // noise chirp
+    const n = noiseSource();
+    const nf = ac.createBiquadFilter(); nf.type = "bandpass";
+    nf.frequency.setValueAtTime(1400 * jitter, t); nf.Q.value = 1.2;
+    const ng = ac.createGain();
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.exponentialRampToValueAtTime((vol||0.5) * 0.5, t + 0.008);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+    n.connect(nf); nf.connect(ng); ng.connect(g);
+    n.start(t); n.stop(t + 0.08);
+  }
+
+  // Rising announce cluck (egg laid): two quick rising notes.
+  function announce() {
+    cluck(0.5);
+    const g = voiceGain(0.22); if (!g) return;
+    const t = ac.currentTime + 0.09;
+    const o = ac.createOscillator();
+    o.type = "sine";
+    o.frequency.setValueAtTime(430, t);
+    o.frequency.exponentialRampToValueAtTime(820, t + 0.18);
+    const og = ac.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.exponentialRampToValueAtTime(0.45, t + 0.02);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+    o.connect(og); og.connect(g);
+    o.start(t); o.stop(t + 0.24);
+  }
+
+  // Squawk: sawtooth w/ vibrato, pitch up then down, bandpassed. ~350ms.
+  function squawk() {
+    const g = voiceGain(0.36); if (!g) return;
+    const t = ac.currentTime;
+    const o = ac.createOscillator();
+    o.type = "sawtooth";
+    const base = rand(360, 460);
+    o.frequency.setValueAtTime(base, t);
+    o.frequency.linearRampToValueAtTime(base * 1.7, t + 0.12);
+    o.frequency.linearRampToValueAtTime(base * 0.8, t + 0.34);
+    const vib = ac.createOscillator(); vib.type = "sine"; vib.frequency.value = 22;
+    const vibg = ac.createGain(); vibg.gain.value = 28;
+    vib.connect(vibg); vibg.connect(o.frequency);
+    const bp = ac.createBiquadFilter(); bp.type = "bandpass";
+    bp.frequency.value = 1100; bp.Q.value = 1.4;
+    const og = ac.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.exponentialRampToValueAtTime(0.5, t + 0.02);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.35);
+    o.connect(bp); bp.connect(og); og.connect(g);
+    o.start(t); vib.start(t); o.stop(t + 0.38); vib.stop(t + 0.38);
+  }
+
+  // Peck tick: 40ms bandpassed noise click.
+  function tick() {
+    const g = voiceGain(0.06); if (!g) return;
+    const t = ac.currentTime;
+    const n = noiseSource();
+    const bp = ac.createBiquadFilter(); bp.type = "bandpass";
+    bp.frequency.value = rand(1800, 2600); bp.Q.value = 6;
+    const ng = ac.createGain();
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.exponentialRampToValueAtTime(0.35, t + 0.004);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.04);
+    n.connect(bp); bp.connect(ng); ng.connect(g);
+    n.start(t); n.stop(t + 0.05);
+  }
+
+  // Egg: short sine pop with an upward pitch bend + soft chime overtone.
+  function egg() {
+    const g = voiceGain(0.28); if (!g) return;
+    const t = ac.currentTime;
+    const o = ac.createOscillator(); o.type = "sine";
+    o.frequency.setValueAtTime(520, t);
+    o.frequency.exponentialRampToValueAtTime(880, t + 0.14);
+    const og = ac.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.exponentialRampToValueAtTime(0.5, t + 0.01);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.26);
+    o.connect(og); og.connect(g);
+    o.start(t); o.stop(t + 0.28);
+    const o2 = ac.createOscillator(); o2.type = "sine";
+    o2.frequency.setValueAtTime(1320, t + 0.02);
+    const o2g = ac.createGain();
+    o2g.gain.setValueAtTime(0.0001, t + 0.02);
+    o2g.gain.exponentialRampToValueAtTime(0.18, t + 0.05);
+    o2g.gain.exponentialRampToValueAtTime(0.0001, t + 0.24);
+    o2.connect(o2g); o2g.connect(g);
+    o2.start(t + 0.02); o2.stop(t + 0.26);
+  }
+
+  // Splash: noise burst with a downward lowpass sweep.
+  function splash() {
+    const g = voiceGain(0.32); if (!g) return;
+    const t = ac.currentTime;
+    const n = noiseSource();
+    const lp = ac.createBiquadFilter(); lp.type = "lowpass";
+    lp.frequency.setValueAtTime(3800, t);
+    lp.frequency.exponentialRampToValueAtTime(500, t + 0.3);
+    const ng = ac.createGain();
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.exponentialRampToValueAtTime(0.4, t + 0.02);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.32);
+    n.connect(lp); lp.connect(ng); ng.connect(g);
+    n.start(t); n.stop(t + 0.34);
+  }
+
+  return { unlock, cluck, announce, squawk, tick, egg, splash,
+           get ready(){ return ready; } };
+})();
+
+/* =========================================================================
+   PARTICLE POOL — dust puffs. Reused objects, hard-capped.
+   ========================================================================= */
+const dustPool = [];
+const dust = [];
+for (let i = 0; i < CONFIG.particleCap; i++) {
+  dustPool.push({ x:0, y:0, vx:0, vy:0, life:0, max:1, r:4, alive:false });
+}
+function spawnDust(x, y, count, spread) {
+  for (let i = 0; i < count; i++) {
+    const p = dustPool.pop();
+    if (!p) return;               // pool exhausted -> silently skip (hard cap)
+    p.x = x + rand(-spread, spread);
+    p.y = y + rand(-spread*0.4, spread*0.2);
+    p.vx = rand(-30, 30);
+    p.vy = rand(-46, -10);
+    p.max = rand(0.4, 0.8);
+    p.life = p.max;
+    p.r = rand(3, 7);
+    p.alive = true;
+    dust.push(p);
+  }
+}
+function updateDust(dt) {
+  for (let i = dust.length - 1; i >= 0; i--) {
+    const p = dust[i];
+    p.life -= dt;
+    if (p.life <= 0) {
+      p.alive = false;
+      dust.splice(i, 1);
+      dustPool.push(p);
+      continue;
+    }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vy += 40 * dt;             // gentle gravity-ish settle
+    p.vx *= 0.96;
+  }
+}
+function drawDust() {
+  for (let i = 0; i < dust.length; i++) {
+    const p = dust[i];
+    const a = clamp(p.life / p.max, 0, 1);
+    ctx.globalAlpha = a * 0.5;
+    ctx.fillStyle = CONFIG.col.dirtDark;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r * (1 + (1 - a) * 0.6), 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* =========================================================================
+   ENTITIES: kernels, eggs, ripples, distant flock
+   ========================================================================= */
+const kernels = [];   // feed on the ground
+const eggs = [];       // eggs in the nest box (oldest first)
+const ripples = [];    // water surface rings
+const flock = [];      // distant sky birds (harmless)
+
+function spawnKernel(x, y) {
+  y = clamp(y, YARD.walkBack, YARD.walkFront);
+  x = clamp(x, YARD.walkMinX, YARD.walkMaxX);
+  kernels.push({
+    x, y, restY: y,
+    vy: rand(-90, -40),          // little bounce before settling
+    settled: false,
+    wobble: rand(0, TAU),
+    c: pick([CONFIG.col.straw, "#D8B45E", "#F0DA9A"]),
+  });
+}
+function updateKernels(dt) {
+  for (let i = 0; i < kernels.length; i++) {
+    const k = kernels[i];
+    if (!k.settled) {
+      k.vy += 520 * dt;
+      k.y += k.vy * dt;
+      if (k.y >= k.restY) {
+        k.y = k.restY;
+        if (Math.abs(k.vy) < 30) { k.settled = true; k.vy = 0; }
+        else k.vy = -k.vy * 0.4;  // bounce
+      }
+    }
+  }
+}
+function drawKernels() {
+  for (let i = 0; i < kernels.length; i++) {
+    const k = kernels[i];
+    ctx.fillStyle = k.c;
+    ctx.beginPath();
+    ctx.ellipse(k.x, k.y, 3.2, 2.4, 0, 0, TAU);
+    ctx.fill();
+  }
+}
+function nearestKernel(x, y, maxD) {
+  let best = -1, bd = maxD * maxD;
+  for (let i = 0; i < kernels.length; i++) {
+    const k = kernels[i];
+    if (!k.settled && k.y < k.restY - 4) continue; // ignore still-flying
+    const dx = k.x - x, dy = k.y - y, d = dx*dx + dy*dy;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+function addRipple(x, y) {
+  ripples.push({ x, y, r: 4, life: 1.4, max: 1.4 });
+}
+function updateRipples(dt) {
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    const r = ripples[i];
+    r.life -= dt;
+    r.r += 60 * dt;
+    if (r.life <= 0) ripples.splice(i, 1);
+  }
+}
+
+function spawnFlock() {
+  const y0 = rand(70, 180);
+  const dir = Math.random() < 0.5 ? 1 : -1;
+  const startX = dir === 1 ? -60 : CONFIG.W + 60;
+  const n = randi(4, 7);
+  for (let i = 0; i < n; i++) {
+    flock.push({
+      x: startX - dir * i * 26,
+      y: y0 + Math.abs(i - (n-1)/2) * 10,
+      baseY: y0 + Math.abs(i - (n-1)/2) * 10,
+      dir, speed: rand(120, 170),
+      flap: rand(0, TAU), phase: rand(0, TAU),
+    });
+  }
+}
+function updateFlock(dt) {
+  for (let i = flock.length - 1; i >= 0; i--) {
+    const b = flock[i];
+    b.x += b.dir * b.speed * dt;
+    b.flap += dt * 9;
+    b.y = b.baseY + Math.sin(b.x * 0.006 + b.phase) * 8;
+    if ((b.dir === 1 && b.x > CONFIG.W + 80) ||
+        (b.dir === -1 && b.x < -80)) flock.splice(i, 1);
+  }
+}
+function drawFlock() {
+  ctx.strokeStyle = "#5B6B7A";
+  ctx.lineWidth = 2.4;
+  ctx.lineCap = "round";
+  for (let i = 0; i < flock.length; i++) {
+    const b = flock[i];
+    const w = 8 + Math.sin(b.flap) * 5;  // wing beat
+    ctx.beginPath();
+    ctx.moveTo(b.x - w, b.y + (w>0?2:5));
+    ctx.lineTo(b.x, b.y);
+    ctx.lineTo(b.x + w, b.y + (w>0?2:5));
+    ctx.stroke();
+  }
+}
+
+/* =========================================================================
+   BIRDS — a small state machine each; act on their own.
+   ========================================================================= */
+const S = { IDLE:0, PECK:1, WANDER:2, PREEN:3, DUSTBATHE:4, STRETCH:5, RUN_TO_FEED:6, STARTLE:7, GO_WATER:8, DRINK:9, GO_COOP:10, LAY:11 };
+
+const birds = [];
+
+function breedColor(breed) {
+  switch (breed) {
+    case "white":  return CONFIG.col.whiteHen;
+    case "red":    return CONFIG.col.redHen;
+    case "barred": return CONFIG.col.barredHen;
+    case "buff":   return CONFIG.col.buffHen;
+    default:       return CONFIG.col.whiteHen;
+  }
+}
+
+function makeBird(type, breed) {
+  const x = rand(YARD.walkMinX + 120, YARD.walkMaxX - 60);
+  const y = rand(YARD.walkBack + 20, YARD.walkFront - 20);
+  return {
+    type,                          // 'hen' | 'duck' | 'chick'
+    breed,
+    color: type === "duck" ? pick([CONFIG.col.whiteHen, CONFIG.col.buffHen])
+          : type === "chick" ? CONFIG.col.buffHen
+          : breedColor(breed),
+    x, y,
+    dir: Math.random() < 0.5 ? 1 : -1,
+    baseScale: (type === "chick" ? 0.9 : 1) *
+               (1 + rand(-CONFIG.birdScaleJitter, CONFIG.birdScaleJitter)),
+    state: S.IDLE,
+    stateT: 0,                     // time in current state
+    stateDur: rand(1, 3),          // planned duration
+    tx: x, ty: y,                  // move target
+    speed: 0,
+    // animation accumulators
+    bob: rand(0, TAU),
+    legPhase: rand(0, TAU),
+    headThrust: 0,
+    headDip: 0,                    // 0..1 peck dip
+    wingOpen: 0,                   // 0 folded .. 1 open
+    wingTwitch: 0,
+    preenTurn: 0,                  // head-back amount
+    stretchAmt: 0,
+    hop: 0,                        // vertical hop offset
+    blinkT: rand(CONFIG.blinkMin, CONFIG.blinkMax),
+    blink: 0,                      // 0 open .. 1 closed
+    pecksLeft: 0,
+    peckT: 0,
+    settle: 0,                     // dustbathe/drink settle 0..1
+    job: null,                     // 'water' for ducks heading to trough
+    speckle: [],                   // static speckle offsets for barred birds
+  };
+}
+
+function seedSpeckles(b) {
+  if (b.breed !== "barred") return;
+  for (let i = 0; i < 7; i++) b.speckle.push({ x: rand(-24,18), y: rand(-14,12), r: rand(2,4) });
+}
+
+function initBirds() {
+  const breeds = ["white","red","barred","buff"];
+  for (let i = 0; i < CONFIG.henCount; i++) {
+    const b = makeBird("hen", breeds[i % breeds.length]);
+    seedSpeckles(b);
+    birds.push(b);
+  }
+  for (let i = 0; i < CONFIG.duckCount; i++) birds.push(makeBird("duck", "white"));
+  for (let i = 0; i < CONFIG.chickCount; i++) birds.push(makeBird("chick", "buff"));
+}
+
+// choose a new autonomous state with per-bird randomized timing
+function chooseState(b) {
+  b.stateT = 0;
+  b.headDip = 0; b.headThrust = 0; b.wingOpen = 0; b.preenTurn = 0;
+  b.stretchAmt = 0; b.settle = 0;
+
+  // feed present nearby? -> run to feed (hens/chicks eagerly, ducks too)
+  const nk = nearestKernel(b.x, b.y, CONFIG.feedAttractRadius);
+  if (nk >= 0 && b.state !== S.STARTLE) {
+    b.state = S.RUN_TO_FEED;
+    b.stateDur = 6;
+    return;
+  }
+
+  const r = Math.random();
+  if (b.type === "duck") {
+    if (r < 0.45)      { b.state = S.WANDER; setWanderTarget(b); b.stateDur = rand(2,4); }
+    else if (r < 0.7)  { b.state = S.IDLE;  b.stateDur = rand(1.5,3.5); }
+    else if (r < 0.88) { b.state = S.PREEN; b.stateDur = rand(1.5,3); }
+    else               { b.state = S.PECK;  startPeck(b); }
+    return;
+  }
+  if (b.type === "chick") {
+    // chicks mostly follow; occasional peck/idle
+    if (r < 0.6)      { b.state = S.WANDER; b.stateDur = rand(1,2.5); }
+    else if (r < 0.85){ b.state = S.PECK;  startPeck(b); }
+    else              { b.state = S.IDLE;  b.stateDur = rand(0.8,2); }
+    return;
+  }
+  // hens
+  if (r < 0.30)      { b.state = S.WANDER; setWanderTarget(b); b.stateDur = rand(2,4.5); }
+  else if (r < 0.52) { b.state = S.PECK;  startPeck(b); }
+  else if (r < 0.66) { b.state = S.IDLE;  b.stateDur = rand(1.5,4); }
+  else if (r < 0.78) { b.state = S.PREEN; b.stateDur = rand(1.8,3.2); }
+  else if (r < 0.88) { b.state = S.STRETCH; b.stateDur = 1.6; }
+  else {
+    // dust bathe only if reasonably near the dust depression
+    const dx = b.x - YARD.dust.cx, dy = b.y - YARD.dust.cy;
+    if (dx*dx + dy*dy < 200*200) { b.state = S.DUSTBATHE; b.stateDur = rand(2.5,4.5); }
+    else { b.state = S.WANDER; b.tx = YARD.dust.cx + rand(-30,30); b.ty = YARD.dust.cy; b.stateDur = 4; }
+  }
+}
+
+function setWanderTarget(b) {
+  b.tx = clamp(b.x + rand(-220, 220), YARD.walkMinX, YARD.walkMaxX);
+  b.ty = clamp(b.y + rand(-70, 70), YARD.walkBack, YARD.walkFront);
+}
+function startPeck(b) {
+  b.state = S.PECK;
+  b.pecksLeft = randi(CONFIG.peckMinDips, CONFIG.peckMaxDips);
+  b.peckT = 0;
+  b.stateDur = b.pecksLeft * CONFIG.peckInterval + 0.3;
+}
+
+function moveToward(b, tx, ty, speed, dt) {
+  const dx = tx - b.x, dy = ty - b.y;
+  const d = Math.hypot(dx, dy);
+  if (d < 1) return 0;
+  const step = Math.min(d, speed * dt);
+  b.x += dx / d * step;
+  b.y += dy / d * step;
+  if (Math.abs(dx) > 2) b.dir = dx > 0 ? 1 : -1;
+  b.x = clamp(b.x, YARD.walkMinX, YARD.walkMaxX);
+  b.y = clamp(b.y, YARD.walkBack, YARD.walkFront);
+  return d - step;
+}
+
+function updateBird(b, dt) {
+  b.stateT += dt;
+
+  // blink runs regardless of state
+  b.blinkT -= dt;
+  if (b.blink > 0) { b.blink -= dt * 8; if (b.blink < 0) b.blink = 0; }
+  else if (b.blinkT <= 0) { b.blink = 1; b.blinkT = rand(CONFIG.blinkMin, CONFIG.blinkMax); }
+
+  // ease wing/preen back toward rest unless a state holds them
+  b.wingTwitch = Math.max(0, b.wingTwitch - dt * 3);
+
+  // chicks: always drift toward nearest hen at a lag
+  if (b.type === "chick") {
+    const h = nearestHen(b);
+    if (h) {
+      const dx = b.x - h.x, dy = b.y - h.y;
+      const d = Math.hypot(dx, dy);
+      if (d > CONFIG.chickFollowLag * 1.6 && b.state !== S.RUN_TO_FEED && b.state !== S.STARTLE) {
+        const tx = h.x + (dx / (d||1)) * CONFIG.chickFollowLag;
+        const ty = h.y + (dy / (d||1)) * CONFIG.chickFollowLag;
+        moveToward(b, tx, ty, CONFIG.walkSpeed * 1.15, dt);
+        animWalk(b, dt);
+      }
+    }
+  }
+
+  switch (b.state) {
+    case S.IDLE: {
+      // subtle head tilt via slow head thrust wobble
+      b.headThrust = Math.sin(b.stateT * 1.4) * 0.5;
+      if (b.stateT >= b.stateDur) chooseState(b);
+      break;
+    }
+    case S.WANDER: {
+      const rem = moveToward(b, b.tx, b.ty, CONFIG.walkSpeed, dt);
+      animWalk(b, dt);
+      if (rem <= 1 || b.stateT >= b.stateDur) chooseState(b);
+      break;
+    }
+    case S.PECK: {
+      b.peckT += dt;
+      const phase = (b.peckT % CONFIG.peckInterval) / CONFIG.peckInterval;
+      b.headDip = Math.sin(phase * Math.PI);   // dip down and back up
+      if (b.peckT >= CONFIG.peckInterval) {
+        b.peckT -= CONFIG.peckInterval;
+        b.pecksLeft--;
+        Audio.tick();
+        spawnDust(b.x, b.y + 4, 2, 6);
+        if (b.pecksLeft <= 0) chooseState(b);
+      }
+      break;
+    }
+    case S.PREEN: {
+      b.preenTurn = easeInOut(clamp(b.stateT / 0.4, 0, 1));
+      if (b.stateT > b.stateDur - 0.4)
+        b.preenTurn = easeInOut(clamp((b.stateDur - b.stateT) / 0.4, 0, 1));
+      b.wingTwitch = 0.5 + Math.sin(b.stateT * 16) * 0.5;
+      if (b.stateT >= b.stateDur) chooseState(b);
+      break;
+    }
+    case S.DUSTBATHE: {
+      b.settle = easeInOut(clamp(b.stateT / 0.6, 0, 1));
+      if (b.stateT > b.stateDur - 0.6)
+        b.settle = easeInOut(clamp((b.stateDur - b.stateT) / 0.6, 0, 1));
+      b.wingTwitch = 0.5 + Math.sin(b.stateT * 20) * 0.5;
+      if (Math.random() < dt * 6) spawnDust(b.x + rand(-14,14), b.y - 2, 3, 10);
+      if (b.stateT >= b.stateDur) chooseState(b);
+      break;
+    }
+    case S.STRETCH: {
+      const t = clamp(b.stateT / b.stateDur, 0, 1);
+      b.stretchAmt = Math.sin(t * Math.PI);   // out then fold back
+      b.wingOpen = b.stretchAmt * 0.6;
+      if (b.stateT >= b.stateDur) chooseState(b);
+      break;
+    }
+    case S.RUN_TO_FEED: {
+      const nk = nearestKernel(b.x, b.y, CONFIG.feedAttractRadius * 1.4);
+      if (nk < 0) { chooseState(b); break; }
+      const k = kernels[nk];
+      const rem = moveToward(b, k.x, k.y, b.type === "duck" ? CONFIG.runSpeed*0.8 : CONFIG.runSpeed, dt);
+      animWalk(b, dt, 1.6);   // exaggerated bob
+      if (rem <= CONFIG.feedEatRadius) {
+        b.headDip = 1;
+        // eat the kernel
+        kernels.splice(nk, 1);
+        Audio.tick();
+        spawnDust(k.x, k.y, 2, 5);
+        if (Math.random() < 0.5) Audio.cluck(0.35);
+      }
+      if (b.stateT >= b.stateDur) chooseState(b);
+      break;
+    }
+    case S.STARTLE: {
+      const t = clamp(b.stateT / 0.5, 0, 1);
+      b.wingOpen = Math.sin(t * Math.PI);
+      b.hop = Math.sin(t * Math.PI) * 14;
+      // small scatter movement
+      moveToward(b, b.tx, b.ty, CONFIG.runSpeed * 0.9, dt);
+      if (b.stateT >= 0.5) { b.hop = 0; b.wingOpen = 0; chooseState(b); }
+      break;
+    }
+    case S.GO_WATER: {
+      const rem = moveToward(b, b.tx, b.ty, CONFIG.duckSpeed * 1.4, dt);
+      animWalk(b, dt, 1.3);
+      if (rem <= 6 || b.stateT > 6) { b.state = S.DRINK; b.stateT = 0; b.stateDur = rand(1.6,2.6); }
+      break;
+    }
+    case S.DRINK: {
+      b.settle = easeInOut(clamp(b.stateT / 0.4, 0, 1));
+      // bill dips periodically
+      b.headDip = Math.abs(Math.sin(b.stateT * 4));
+      if (Math.random() < dt * 3) { addRipple(b.x + b.dir*24, YARD.trough.y + 14); Audio.splash(); }
+      if (b.stateT >= b.stateDur) { b.job = null; chooseState(b); }
+      break;
+    }
+    case S.GO_COOP: {
+      // a hen walks over to the nest box to lay on her own
+      const rem = moveToward(b, b.tx, b.ty, CONFIG.walkSpeed * 1.1, dt);
+      animWalk(b, dt);
+      if (rem <= 8 || b.stateT > 7) {
+        b.state = S.LAY; b.stateT = 0; b.stateDur = 2.2; b._laid = false;
+        nestLid.target = 1;                 // lid pops open so the egg is visible
+      }
+      break;
+    }
+    case S.LAY: {
+      b.settle = easeInOut(clamp(b.stateT / 0.5, 0, 1));   // squat down
+      if (b.stateT > b.stateDur - 0.5)
+        b.settle = easeInOut(clamp((b.stateDur - b.stateT) / 0.5, 0, 1));
+      if (!b._laid && b.stateT >= 0.5) {
+        b._laid = true;
+        addEgg();
+        Audio.egg();
+        Audio.announce();
+        spawnDust(b.x, b.y + 4, 3, 8);
+      }
+      if (b.stateT >= b.stateDur) { nestLid.target = 0; b.job = null; chooseState(b); }
+      break;
+    }
+  }
+}
+
+function animWalk(b, dt, amp) {
+  amp = amp || 1;
+  b.legPhase += dt * (b.state === S.RUN_TO_FEED ? 16 : 10);
+  b.bob += dt * (b.state === S.RUN_TO_FEED ? 16 : 10);
+  b.headThrust = Math.sin(b.legPhase) * 0.8 * amp;
+}
+
+function nearestHen(chick) {
+  let best = null, bd = Infinity;
+  for (let i = 0; i < birds.length; i++) {
+    const h = birds[i];
+    if (h.type !== "hen") continue;
+    const dx = h.x - chick.x, dy = h.y - chick.y, d = dx*dx + dy*dy;
+    if (d < bd) { bd = d; best = h; }
+  }
+  return best;
+}
+
+/* =========================================================================
+   BIRD DRAWING — each function is one body part. All vector paths.
+   Local space: bird faces +x (right); dir flips the whole sprite.
+   ========================================================================= */
+function drawBird(b) {
+  const depth = (b.y - YARD.walkBack) / (YARD.walkFront - YARD.walkBack);
+  const dScale = lerp(CONFIG.depthScaleBack, CONFIG.depthScaleFront, clamp(depth, 0, 1));
+  const s = dScale * b.baseScale;
+
+  const bob = Math.sin(b.bob) * (b.state === S.WANDER || b.state === S.RUN_TO_FEED ? 3 : 0.6);
+  const settleDrop = b.settle * 10;          // dustbathe / drink lowers body
+  const groundY = b.y + bob + settleDrop - b.hop;
+
+  ctx.save();
+  ctx.translate(b.x, groundY);
+  ctx.scale(b.dir * s, s);
+
+  // soft contact shadow
+  ctx.globalAlpha = 0.16;
+  ctx.fillStyle = "#3A2C1E";
+  ctx.beginPath();
+  ctx.ellipse(0, 8, 34, 8, 0, 0, TAU);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  if (b.type === "duck") drawDuck(b);
+  else if (b.type === "chick") drawChick(b);
+  else drawHen(b);
+
+  ctx.restore();
+}
+
+/* HEN — full assembly */
+function drawHen(b) {
+  const col = b.color;
+  const legY = 6;
+  const bodyW = 66, bodyH = 46;
+  const dip = b.headDip;                 // 0..1 peck/eat
+  const walkLeg = Math.sin(b.legPhase);
+
+  drawLegs(legY, walkLeg, b.state, b.stretchAmt);
+  drawTail(-bodyW*0.42, -bodyH*0.28, col, b.breed);
+  drawBody(bodyW, bodyH, col, b.breed, b.speckle);
+  drawWing(b, col, bodyW, bodyH);
+  // neck + head
+  const neckX = bodyW*0.34;
+  const headBaseY = -bodyH*0.62;
+  const thrust = b.headThrust * 4;
+  const dipY = dip * 34;                 // head drops toward ground
+  const preen = b.preenTurn;             // head turns back
+  const hx = preen > 0 ? lerp(neckX+thrust, -bodyW*0.15, preen) : neckX + thrust;
+  const hy = preen > 0 ? lerp(headBaseY, -bodyH*0.25, preen) : headBaseY + dipY;
+  drawNeck(bodyW*0.22, -bodyH*0.3, hx, hy, col);
+  drawHead(hx, hy, 17, col, b, preen);
+}
+
+/* CHICK — small, round, stubby wings, no comb */
+function drawChick(b) {
+  const col = CONFIG.col.buffHen;
+  const legY = 4;
+  drawLegs(legY, Math.sin(b.legPhase), b.state, 0, 0.6);
+  // round body
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.ellipse(0, -10, 20, 18, 0, 0, TAU);
+  ctx.fill();
+  // stubby wing
+  ctx.fillStyle = shade(col, -0.08);
+  ctx.beginPath();
+  ctx.ellipse(-2, -8, 9, 7, 0.3, 0, TAU);
+  ctx.fill();
+  // head
+  const dipY = b.headDip * 16;
+  const hx = 10 + b.headThrust*2, hy = -26 + dipY;
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.arc(hx, hy, 12, 0, TAU);
+  ctx.fill();
+  // beak
+  ctx.fillStyle = CONFIG.col.beakLeg;
+  ctx.beginPath();
+  ctx.moveTo(hx+10, hy-1); ctx.lineTo(hx+18, hy+1); ctx.lineTo(hx+10, hy+4);
+  ctx.closePath(); ctx.fill();
+  drawEye(hx+5, hy-2, 2.2, b.blink);
+}
+
+/* DUCK — flatter body, rounded bill, no comb */
+function drawDuck(b) {
+  const col = b.color;
+  const legY = 6;
+  drawLegs(legY, Math.sin(b.legPhase), b.state, b.stretchAmt);
+  // tail (short, upturned)
+  ctx.fillStyle = shade(col, -0.1);
+  ctx.beginPath();
+  ctx.moveTo(-40, -18); ctx.quadraticCurveTo(-58, -30, -46, -12);
+  ctx.quadraticCurveTo(-52, -6, -38, -8); ctx.closePath(); ctx.fill();
+  // flatter body
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.ellipse(0, -14, 44, 26, 0, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = shade(col, -0.06);
+  ctx.beginPath();
+  ctx.ellipse(-4, -8, 40, 18, 0, 0, TAU);
+  ctx.fill();
+  // wing
+  drawWing(b, col, 66, 40);
+  // long neck + head
+  const dipY = b.headDip * 30;
+  const preen = b.preenTurn;
+  const hx = preen>0 ? lerp(34, -8, preen) : 34 + b.headThrust*3;
+  const hy = preen>0 ? lerp(-46, -18, preen) : -46 + dipY;
+  drawNeck(20, -26, hx, hy, col);
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.arc(hx, hy, 15, 0, TAU);
+  ctx.fill();
+  // rounded bill
+  ctx.fillStyle = CONFIG.col.beakLeg;
+  ctx.beginPath();
+  ctx.ellipse(hx+16, hy+2, 12, 6, 0.05, 0, TAU);
+  ctx.fill();
+  drawEye(hx+4, hy-3, 2.4, b.blink);
+}
+
+/* legs + three-toed feet */
+function drawLegs(legY, walk, state, stretch, sizeMul) {
+  sizeMul = sizeMul || 1;
+  ctx.strokeStyle = CONFIG.col.beakLeg;
+  ctx.lineWidth = 3.2 * sizeMul;
+  ctx.lineCap = "round";
+  const swing = (state === S.WANDER || state === S.RUN_TO_FEED) ? walk * 6 : 0;
+  const legLen = (16 - (state===S.DUSTBATHE||state===S.DRINK ? 8 : 0)) * sizeMul;
+  const stretchLeg = stretch * 12;
+  // back leg
+  foot(-4 - swing, legY, legLen, sizeMul);
+  // front leg (stretches out during STRETCH)
+  foot(6 + swing + stretchLeg, legY, legLen, sizeMul);
+}
+function foot(x, y0, len, sizeMul) {
+  ctx.beginPath();
+  ctx.moveTo(x, y0);
+  ctx.lineTo(x, y0 + len);
+  ctx.stroke();
+  const fy = y0 + len;
+  ctx.lineWidth = 2 * sizeMul;
+  ctx.beginPath();
+  ctx.moveTo(x, fy); ctx.lineTo(x + 6*sizeMul, fy + 4*sizeMul);
+  ctx.moveTo(x, fy); ctx.lineTo(x + 7*sizeMul, fy);
+  ctx.moveTo(x, fy); ctx.lineTo(x + 5*sizeMul, fy - 4*sizeMul);
+  ctx.stroke();
+  ctx.lineWidth = 3.2 * sizeMul;
+}
+
+/* body oval with a bit of soft shading */
+function drawBody(w, h, col, breed, speckle) {
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.ellipse(0, -h*0.35, w*0.5, h*0.55, 0, 0, TAU);
+  ctx.fill();
+  // belly shade
+  ctx.fillStyle = shade(col, -0.08);
+  ctx.beginPath();
+  ctx.ellipse(-3, -h*0.15, w*0.44, h*0.4, 0, 0, TAU);
+  ctx.fill();
+  // barred speckles
+  if (breed === "barred" && speckle) {
+    ctx.fillStyle = "#9A9A94";
+    for (let i = 0; i < speckle.length; i++) {
+      const p = speckle[i];
+      ctx.beginPath();
+      ctx.ellipse(p.x, -h*0.3 + p.y, p.r, p.r*0.6, 0.5, 0, TAU);
+      ctx.fill();
+    }
+  }
+}
+
+/* layered tail */
+function drawTail(x, y, col, breed) {
+  ctx.save();
+  ctx.translate(x, y);
+  const layers = [
+    { c: shade(col, -0.14), a: 0.9,  s: 1.0 },
+    { c: col,               a: 0.55, s: 0.8 },
+    { c: shade(col, -0.22), a: 0.65, s: 0.6 },
+  ];
+  for (let i = 0; i < layers.length; i++) {
+    const L = layers[i];
+    ctx.fillStyle = L.c;
+    ctx.beginPath();
+    ctx.moveTo(0, 6);
+    ctx.quadraticCurveTo(-30 * L.s - i*4, -18 * L.a, -20 * L.s, -30 * L.a);
+    ctx.quadraticCurveTo(-6, -18, 4, -4);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* wing that folds against the body (opens for stretch/startle, twitches on preen) */
+function drawWing(b, col, w, h) {
+  const open = b.wingOpen || 0;
+  const twitch = (b.wingTwitch || 0) * 3;
+  ctx.save();
+  ctx.translate(-2, -h*0.35);
+  ctx.rotate(-open * 0.9);           // rotate open upward
+  ctx.fillStyle = shade(col, -0.12);
+  ctx.beginPath();
+  if (open > 0.05) {
+    // spread wing
+    ctx.moveTo(-w*0.1, 0);
+    ctx.quadraticCurveTo(w*0.2, -h*0.7 - open*20, w*0.5 + open*20, -h*0.2);
+    ctx.quadraticCurveTo(w*0.2, h*0.1, -w*0.1, 4);
+  } else {
+    // folded
+    ctx.ellipse(0, twitch*0.2, w*0.30, h*0.30, -0.15, 0, TAU);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = shade(col, -0.2);
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* neck connecting body to head */
+function drawNeck(x0, y0, x1, y1, col) {
+  ctx.strokeStyle = col;
+  ctx.lineWidth = 15;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.quadraticCurveTo((x0+x1)/2, (y0+y1)/2 - 4, x1, y1);
+  ctx.stroke();
+}
+
+/* head circle + comb + wattle + beak + eye */
+function drawHead(hx, hy, r, col, b, preen) {
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.arc(hx, hy, r, 0, TAU);
+  ctx.fill();
+
+  // comb — three bumps on top (hens only)
+  ctx.fillStyle = CONFIG.col.comb;
+  ctx.beginPath();
+  for (let i = 0; i < 3; i++) {
+    const cx = hx - r*0.4 + i * r*0.45;
+    ctx.moveTo(cx, hy - r*0.75);
+    ctx.arc(cx, hy - r*0.85, r*0.28, 0, Math.PI, true);
+  }
+  ctx.fill();
+
+  // wattle — under the beak
+  ctx.fillStyle = CONFIG.col.comb;
+  ctx.beginPath();
+  ctx.ellipse(hx + r*0.55, hy + r*0.7, r*0.22, r*0.4, 0, 0, TAU);
+  ctx.fill();
+
+  // beak — wedge (hidden when head fully turned back)
+  if (preen < 0.6) {
+    ctx.globalAlpha = 1 - preen;
+    ctx.fillStyle = CONFIG.col.beakLeg;
+    ctx.beginPath();
+    ctx.moveTo(hx + r*0.8, hy - r*0.2);
+    ctx.lineTo(hx + r*1.7, hy + r*0.1);
+    ctx.lineTo(hx + r*0.8, hy + r*0.35);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  // eye
+  drawEye(hx + r*0.35, hy - r*0.15, r*0.16, b.blink);
+}
+
+/* eye dot with a highlight; blink closes it to a line */
+function drawEye(x, y, r, blink) {
+  if (blink > 0.5) {
+    ctx.strokeStyle = "#2A2A2A";
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(x - r*1.6, y); ctx.lineTo(x + r*1.6, y);
+    ctx.stroke();
+    return;
+  }
+  ctx.fillStyle = "#20201C";
+  ctx.beginPath();
+  ctx.arc(x, y, Math.max(2, r*1.4), 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = "#FFFFFF";
+  ctx.beginPath();
+  ctx.arc(x - r*0.4, y - r*0.5, Math.max(0.8, r*0.5), 0, TAU);
+  ctx.fill();
+}
+
+// darken/lighten a hex color by t (-1..1)
+function shade(hex, t) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  if (t < 0) { const k = 1 + t; r*=k; g*=k; b*=k; }
+  else { r += (255-r)*t; g += (255-g)*t; b += (255-b)*t; }
+  return "rgb(" + (r|0) + "," + (g|0) + "," + (b|0) + ")";
+}
+
+/* =========================================================================
+   SCENE — static-ish layers back to front.
+   ========================================================================= */
+let skyGrad = null;
+function buildSkyGrad() {
+  skyGrad = ctx.createLinearGradient(0, 0, 0, YARD.grassY);
+  skyGrad.addColorStop(0, CONFIG.col.skyTop);
+  skyGrad.addColorStop(1, CONFIG.col.skyLow);
+}
+
+// clouds drift slowly and wrap
+const clouds = [
+  { x: 250, y: 90,  s: 1.0, spd: 6 },
+  { x: 650, y: 140, s: 1.3, spd: 4 },
+  { x: 1050,y: 70,  s: 0.8, spd: 7 },
+];
+function updateClouds(dt) {
+  for (const c of clouds) {
+    c.x += c.spd * dt;
+    if (c.x - 120*c.s > CONFIG.W) c.x = -120*c.s;
+  }
+}
+function drawCloud(c) {
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.beginPath();
+  const s = c.s;
+  ctx.ellipse(c.x, c.y, 60*s, 26*s, 0, 0, TAU);
+  ctx.ellipse(c.x+42*s, c.y+6*s, 44*s, 22*s, 0, 0, TAU);
+  ctx.ellipse(c.x-42*s, c.y+8*s, 40*s, 20*s, 0, 0, TAU);
+  ctx.fill();
+}
+
+// static straw scatter (seeded once so it doesn't flicker)
+const straws = [];
+function seedStraw() {
+  for (let i = 0; i < 90; i++) {
+    straws.push({
+      x: rand(YARD.walkMinX, YARD.walkMaxX),
+      y: rand(YARD.groundY + 10, YARD.walkFront + 8),
+      a: rand(0, TAU),
+      len: rand(8, 16),
+    });
+  }
+}
+// static trees in the middle ground
+const trees = [
+  { x: 470, y: YARD.grassY + 6, s: 1.0 },
+  { x: 900, y: YARD.grassY + 2, s: 1.2 },
+];
+
+function drawSky() {
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, CONFIG.W, YARD.grassY);
+  for (const c of clouds) drawCloud(c);
+}
+
+function drawMountains() {
+  ctx.fillStyle = CONFIG.col.mountains;
+  ctx.beginPath();
+  ctx.moveTo(0, YARD.horizonY);
+  const peaks = [
+    [0,300],[120,250],[240,290],[360,235],[500,285],[640,245],
+    [780,295],[900,255],[1040,300],[1180,260],[1280,300]
+  ];
+  ctx.lineTo(peaks[0][0], peaks[0][1]);
+  for (let i = 1; i < peaks.length; i++) ctx.lineTo(peaks[i][0], peaks[i][1]);
+  ctx.lineTo(CONFIG.W, YARD.grassY);
+  ctx.lineTo(0, YARD.grassY);
+  ctx.closePath();
+  ctx.fill();
+  // hazy second ridge
+  ctx.fillStyle = shade(CONFIG.col.mountains, 0.12);
+  ctx.beginPath();
+  ctx.moveTo(0, YARD.grassY);
+  ctx.lineTo(0, 315); ctx.lineTo(180,285); ctx.lineTo(420,320);
+  ctx.lineTo(700,290); ctx.lineTo(980,325); ctx.lineTo(1280,300);
+  ctx.lineTo(CONFIG.W, YARD.grassY);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawGrass() {
+  ctx.fillStyle = CONFIG.col.grass;
+  ctx.fillRect(0, YARD.grassY - 4, CONFIG.W, (YARD.groundY - YARD.grassY) + 8);
+  // simple grass tuft texture
+  ctx.strokeStyle = shade(CONFIG.col.grass, -0.12);
+  ctx.lineWidth = 2;
+  for (let x = 0; x < CONFIG.W; x += 22) {
+    const gy = YARD.grassY + 6 + ((x*13) % 10);
+    ctx.beginPath();
+    ctx.moveTo(x, gy); ctx.lineTo(x-3, gy-8);
+    ctx.moveTo(x, gy); ctx.lineTo(x+3, gy-9);
+    ctx.stroke();
+  }
+  for (const t of trees) drawTree(t);
+}
+
+function drawTree(t) {
+  ctx.save();
+  ctx.translate(t.x, t.y);
+  ctx.scale(t.s, t.s);
+  // trunk
+  ctx.fillStyle = CONFIG.col.coopRoof;
+  ctx.fillRect(-6, -40, 12, 40);
+  // canopy
+  ctx.fillStyle = shade(CONFIG.col.grass, -0.05);
+  ctx.beginPath();
+  ctx.arc(0, -58, 34, 0, TAU);
+  ctx.arc(-24, -46, 24, 0, TAU);
+  ctx.arc(24, -46, 24, 0, TAU);
+  ctx.fill();
+  // a couple of fruit dots
+  ctx.fillStyle = CONFIG.col.redHen;
+  ctx.beginPath();
+  ctx.arc(-10,-56,4,0,TAU); ctx.arc(14,-50,4,0,TAU); ctx.arc(4,-66,4,0,TAU);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawGround() {
+  // packed dirt
+  ctx.fillStyle = CONFIG.col.dirt;
+  ctx.fillRect(0, YARD.groundY, CONFIG.W, CONFIG.H - YARD.groundY);
+  // darker mottling toward the front
+  ctx.fillStyle = CONFIG.col.dirtDark;
+  ctx.globalAlpha = 0.4;
+  for (let i = 0; i < 40; i++) {
+    const x = (i * 137) % CONFIG.W;
+    const y = YARD.groundY + 20 + ((i*53) % (CONFIG.H - YARD.groundY - 20));
+    ctx.beginPath();
+    ctx.ellipse(x, y, 22, 8, 0, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // dust-bath depression
+  const d = YARD.dust;
+  ctx.fillStyle = CONFIG.col.dirtDark;
+  ctx.beginPath();
+  ctx.ellipse(d.cx, d.cy, d.rx, d.ry, 0, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = shade(CONFIG.col.dirtDark, -0.08);
+  ctx.beginPath();
+  ctx.ellipse(d.cx, d.cy + 3, d.rx*0.7, d.ry*0.6, 0, 0, TAU);
+  ctx.fill();
+
+  // scattered straw
+  ctx.strokeStyle = CONFIG.col.straw;
+  ctx.lineWidth = 2;
+  for (const s of straws) {
+    ctx.beginPath();
+    ctx.moveTo(s.x, s.y);
+    ctx.lineTo(s.x + Math.cos(s.a)*s.len, s.y + Math.sin(s.a)*s.len*0.4);
+    ctx.stroke();
+  }
+}
+
+/* COOP with pitched roof, round door, and external nest box (hinged lid) */
+let nestLid = { open: 0, target: 0 };  // 0 closed .. 1 open
+function drawCoop() {
+  const c = YARD.coop;
+  // body
+  ctx.fillStyle = CONFIG.col.coopWood;
+  ctx.fillRect(c.x, c.y + 40, c.w, c.h - 40);
+  // plank lines
+  ctx.strokeStyle = shade(CONFIG.col.coopWood, -0.12);
+  ctx.lineWidth = 2;
+  for (let x = c.x + 20; x < c.x + c.w; x += 30) {
+    ctx.beginPath(); ctx.moveTo(x, c.y + 40); ctx.lineTo(x, c.y + c.h); ctx.stroke();
+  }
+  // pitched roof
+  ctx.fillStyle = CONFIG.col.coopRoof;
+  ctx.beginPath();
+  ctx.moveTo(c.x - 16, c.y + 48);
+  ctx.lineTo(c.x + c.w*0.5, c.y - 10);
+  ctx.lineTo(c.x + c.w + 16, c.y + 48);
+  ctx.closePath();
+  ctx.fill();
+  ctx.fillStyle = shade(CONFIG.col.coopRoof, -0.12);
+  ctx.fillRect(c.x - 16, c.y + 48, c.w + 32, 8);
+  // round door
+  ctx.fillStyle = CONFIG.col.coopRoof;
+  ctx.beginPath();
+  ctx.arc(c.x + c.w*0.4, c.y + c.h - 44, 34, Math.PI, TAU);
+  ctx.rect(c.x + c.w*0.4 - 34, c.y + c.h - 44, 68, 44);
+  ctx.fill();
+  ctx.fillStyle = "#2A1B10";
+  ctx.beginPath();
+  ctx.arc(c.x + c.w*0.4, c.y + c.h - 48, 26, Math.PI, TAU);
+  ctx.rect(c.x + c.w*0.4 - 26, c.y + c.h - 48, 52, 48);
+  ctx.fill();
+
+  drawNestBox();
+}
+
+function drawNestBox() {
+  const n = YARD.nest;
+  // box body
+  ctx.fillStyle = shade(CONFIG.col.coopWood, 0.06);
+  ctx.fillRect(n.x, n.y, n.w, n.h);
+  ctx.strokeStyle = shade(CONFIG.col.coopWood, -0.15);
+  ctx.lineWidth = 2;
+  ctx.strokeRect(n.x, n.y, n.w, n.h);
+  // interior shadow (visible when lid opens)
+  ctx.fillStyle = "#3A2A1B";
+  ctx.fillRect(n.x + 4, n.y + 6, n.w - 8, n.h - 12);
+  // a bit of straw bedding
+  ctx.strokeStyle = CONFIG.col.straw;
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 8; i++) {
+    const sx = n.x + 12 + i*13;
+    ctx.beginPath();
+    ctx.moveTo(sx, n.y + n.h - 12);
+    ctx.lineTo(sx + 8, n.y + n.h - 20);
+    ctx.stroke();
+  }
+  // eggs inside (drawn before lid so lid can cover)
+  drawEggs();
+
+  // hinged lid — swings up around its back-top edge
+  const ang = -nestLid.open * (Math.PI * 0.62);
+  ctx.save();
+  ctx.translate(n.x, n.y);        // hinge at top-left of the box (back edge)
+  ctx.rotate(ang);
+  ctx.fillStyle = CONFIG.col.coopRoof;
+  ctx.fillRect(0, -12, n.w + 6, 14);
+  ctx.fillStyle = shade(CONFIG.col.coopRoof, 0.08);
+  ctx.fillRect(0, -12, n.w + 6, 4);
+  ctx.restore();
+}
+
+function drawEggs() {
+  const n = YARD.nest;
+  for (let i = 0; i < eggs.length; i++) {
+    const e = eggs[i];
+    const a = e.appear < 1 ? easeOut(e.appear) : (e.fade < 1 ? e.fade : 1);
+    ctx.globalAlpha = clamp(a, 0, 1);
+    ctx.fillStyle = CONFIG.col.egg;
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.scale(1, 0.82);
+    ctx.beginPath();
+    ctx.arc(0, 0, 12, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+    // subtle highlight
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.beginPath();
+    ctx.ellipse(e.x - 3, e.y - 4, 3, 2, 0, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function addEgg() {
+  const n = YARD.nest;
+  // pack eggs in a loose 4-wide double row inside the box
+  const idx = eggs.length;
+  const col = idx % 4, row = (idx >> 2) % 2;
+  const x = n.x + 24 + col * 24 + rand(-2,2);
+  const y = n.y + n.h - 22 - row * 20 + rand(-2,2);
+  eggs.push({ x, y, appear: 0, fade: 1, fading: false });
+  if (eggs.length > CONFIG.eggMax) eggs[0].fading = true; // oldest starts to fade
+}
+function updateEggs(dt) {
+  for (let i = eggs.length - 1; i >= 0; i--) {
+    const e = eggs[i];
+    if (e.appear < 1) e.appear = Math.min(1, e.appear + dt * 3);
+    if (e.fading) {
+      e.fade -= dt * 1.5;
+      if (e.fade <= 0) eggs.splice(i, 1);
+    }
+  }
+}
+
+/* WATER TROUGH + ripples */
+function drawTrough() {
+  const t = YARD.trough;
+  // trough basin
+  ctx.fillStyle = shade(CONFIG.col.lumber, -0.1);
+  ctx.beginPath();
+  ctx.moveTo(t.x, t.y);
+  ctx.lineTo(t.x + t.w, t.y);
+  ctx.lineTo(t.x + t.w - 10, t.y + t.h);
+  ctx.lineTo(t.x + 10, t.y + t.h);
+  ctx.closePath();
+  ctx.fill();
+  // water surface
+  ctx.fillStyle = CONFIG.col.water;
+  ctx.beginPath();
+  ctx.ellipse(t.x + t.w/2, t.y + 10, t.w/2 - 6, 12, 0, 0, TAU);
+  ctx.fill();
+  ctx.fillStyle = shade(CONFIG.col.water, 0.15);
+  ctx.beginPath();
+  ctx.ellipse(t.x + t.w/2, t.y + 8, t.w/2 - 14, 8, 0, 0, TAU);
+  ctx.fill();
+  // ripples clipped to the surface
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(t.x + t.w/2, t.y + 10, t.w/2 - 6, 12, 0, 0, TAU);
+  ctx.clip();
+  for (const r of ripples) {
+    ctx.globalAlpha = clamp(r.life / r.max, 0, 1) * 0.7;
+    ctx.strokeStyle = "#EAF6FB";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.ellipse(r.x, r.y, r.r, r.r*0.4, 0, 0, TAU);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+
+/* FENCE — foreground: 2x4 posts + rails + hardware-cloth mesh grid */
+function drawFence() {
+  const topRail = YARD.groundY - 8;
+  const botRail = CONFIG.H - 8;
+  const postW = 12;
+  // mesh (subtle grid) first, behind the lumber
+  ctx.strokeStyle = CONFIG.col.mesh;
+  ctx.globalAlpha = CONFIG.col.meshAlpha;
+  ctx.lineWidth = 1;
+  const cell = 20;
+  ctx.beginPath();
+  for (let x = 0; x <= CONFIG.W; x += cell) { ctx.moveTo(x, topRail); ctx.lineTo(x, botRail); }
+  for (let y = topRail; y <= botRail; y += cell) { ctx.moveTo(0, y); ctx.lineTo(CONFIG.W, y); }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // rails (top + bottom)
+  ctx.fillStyle = CONFIG.col.lumber;
+  ctx.fillRect(0, topRail, CONFIG.W, 12);
+  ctx.fillRect(0, botRail, CONFIG.W, 14);
+  ctx.strokeStyle = shade(CONFIG.col.lumber, -0.15);
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(0, topRail, CONFIG.W, 12);
+
+  // vertical posts
+  ctx.fillStyle = CONFIG.col.lumber;
+  for (let x = 60; x < CONFIG.W; x += 240) {
+    ctx.fillRect(x, topRail, postW, botRail - topRail + 14);
+    ctx.strokeStyle = shade(CONFIG.col.lumber, -0.18);
+    ctx.strokeRect(x, topRail, postW, botRail - topRail + 14);
+    // wood grain
+    ctx.strokeStyle = shade(CONFIG.col.lumber, -0.1);
+    ctx.beginPath();
+    ctx.moveTo(x + postW/2, topRail + 6);
+    ctx.lineTo(x + postW/2, botRail);
+    ctx.stroke();
+  }
+}
+
+/* =========================================================================
+   INTERACTIONS — hit testing + responses
+   ========================================================================= */
+function nearestBird(x, y, maxR) {
+  let best = -1, bd = maxR * maxR;
+  for (let i = 0; i < birds.length; i++) {
+    const b = birds[i];
+    const dx = b.x - x, dy = (b.y - 18) - y;
+    const d = dx*dx + dy*dy;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+function inRect(x, y, r, pad) {
+  pad = pad || 0;
+  return x >= r.x - pad && x <= r.x + r.w + pad && y >= r.y - pad && y <= r.y + r.h + pad;
+}
+
+function scatterFeed(x, y) {
+  const n = randi(CONFIG.feedScatterMin, CONFIG.feedScatterMax);
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, TAU), r = rand(0, CONFIG.feedScatterRadius);
+    spawnKernel(x + Math.cos(a)*r, y + Math.sin(a)*r*0.5);
+  }
+  spawnDust(x, y, 4, 14);
+  // nudge nearby birds to run for it + a little excited clucking
+  let clucks = 0;
+  for (const b of birds) {
+    const dx = b.x - x, dy = b.y - y;
+    if (dx*dx + dy*dy < CONFIG.feedAttractRadius*CONFIG.feedAttractRadius) {
+      if (b.state !== S.STARTLE) { b.state = S.RUN_TO_FEED; b.stateT = 0; b.stateDur = 6; }
+      if (clucks < 3 && Math.random() < 0.5) { Audio.cluck(0.4); clucks++; }
+    }
+  }
+}
+
+function pokeBird(i) {
+  const b = birds[i];
+  b.state = S.STARTLE;
+  b.stateT = 0;
+  b.hop = 0;
+  // scatter target: a short hop away from the poke
+  const away = rand(0, TAU);
+  b.tx = clamp(b.x + Math.cos(away)*70, YARD.walkMinX, YARD.walkMaxX);
+  b.ty = clamp(b.y + Math.sin(away)*40, YARD.walkBack, YARD.walkFront);
+  Audio.squawk();
+  spawnDust(b.x, b.y + 6, 5, 12);
+  // the two or three nearest birds startle briefly and scatter
+  const others = [];
+  for (let j = 0; j < birds.length; j++) {
+    if (j === i) continue;
+    const o = birds[j];
+    const dx = o.x - b.x, dy = o.y - b.y;
+    others.push({ j, d: dx*dx + dy*dy });
+  }
+  others.sort((a, c) => a.d - c.d);
+  const k = randi(2, 3);
+  for (let m = 0; m < k && m < others.length; m++) {
+    const o = birds[others[m].j];
+    if (o.state === S.STARTLE) continue;
+    o.state = S.STARTLE; o.stateT = 0;
+    const a2 = Math.atan2(o.y - b.y, o.x - b.x);
+    o.tx = clamp(o.x + Math.cos(a2)*60, YARD.walkMinX, YARD.walkMaxX);
+    o.ty = clamp(o.y + Math.sin(a2)*36, YARD.walkBack, YARD.walkFront);
+  }
+}
+
+function openNest() {
+  nestLid.target = 1;
+  // add an egg after the lid has begun to open
+  setTimeout(() => {
+    if (eggs.length >= CONFIG.eggMax) { addEgg(); }
+    else addEgg();
+    Audio.egg();
+    Audio.announce();     // a hen announces with a rising cluck
+  }, 180);
+  // auto-close after a beat
+  clearTimeout(openNest._t);
+  openNest._t = setTimeout(() => { nestLid.target = 0; }, 2200);
+}
+
+function pokeWater() {
+  const t = YARD.trough;
+  addRipple(t.x + t.w/2, t.y + 10);
+  addRipple(t.x + t.w/2 + rand(-20,20), t.y + 10 + rand(-4,4));
+  Audio.splash();
+  // ducks waddle over and dip bills
+  for (const b of birds) {
+    if (b.type !== "duck") continue;
+    b.job = "water";
+    b.state = S.GO_WATER; b.stateT = 0; b.stateDur = 6;
+    b.tx = clamp(t.x + rand(20, t.w-20), YARD.walkMinX, YARD.walkMaxX);
+    b.ty = clamp(t.y + 22, YARD.walkBack, YARD.walkFront);
+  }
+}
+
+// Route a tap to the right response by priority.
+function handleTap(x, y) {
+  // nest box lid
+  if (inRect(x, y, YARD.nest, 24) && y < YARD.nest.y + 40) { openNest(); return; }
+  // water trough
+  if (inRect(x, y, YARD.trough, 24)) { pokeWater(); return; }
+  // a bird (generous radius)
+  const bi = nearestBird(x, y, CONFIG.touchRadius);
+  if (bi >= 0) { pokeBird(bi); return; }
+  // sky -> distant flock
+  if (y < YARD.horizonY) { spawnFlock(); Audio.cluck(0.25); return; }
+  // otherwise: scatter feed on the ground
+  if (y >= YARD.groundY - 10) { scatterFeed(x, y); return; }
+  // above ground band but not sky -> gentle flock too
+  spawnFlock();
+}
+
+/* -------------------------------------------------------------------------
+   Pointer input — up to 5 pointers, tap vs drag.
+   ------------------------------------------------------------------------- */
+const pointers = new Map();
+const DRAG_THRESH = 14;
+
+function onDown(e) {
+  Audio.unlock();
+  const p = toLogical(e.clientX, e.clientY);
+  pointers.set(e.pointerId, {
+    startX: p.x, startY: p.y, lastX: p.x, lastY: p.y,
+    dragging: false, lastDropX: p.x, lastDropY: p.y,
+  });
+}
+function onMove(e) {
+  const st = pointers.get(e.pointerId);
+  if (!st) return;
+  // coalesced events give smoother trails on fast drags
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ev of evs) {
+    const p = toLogical(ev.clientX, ev.clientY);
+    st.lastX = p.x; st.lastY = p.y;
+    const dx = p.x - st.startX, dy = p.y - st.startY;
+    if (!st.dragging && (dx*dx + dy*dy) > DRAG_THRESH*DRAG_THRESH) st.dragging = true;
+    if (st.dragging) {
+      // drop a feed trail as the finger travels (throttled by distance)
+      const ddx = p.x - st.lastDropX, ddy = p.y - st.lastDropY;
+      if (ddx*ddx + ddy*ddy > CONFIG.dragFeedSpacing*CONFIG.dragFeedSpacing &&
+          p.y >= YARD.groundY - 20) {
+        spawnKernel(p.x, p.y);
+        if (Math.random() < 0.5) spawnKernel(p.x + rand(-10,10), p.y + rand(-6,6));
+        st.lastDropX = p.x; st.lastDropY = p.y;
+        // wake nearby birds to follow the trail
+        for (const b of birds) {
+          const bx = b.x - p.x, by = b.y - p.y;
+          if (bx*bx + by*by < CONFIG.feedAttractRadius*CONFIG.feedAttractRadius &&
+              b.state !== S.STARTLE) { b.state = S.RUN_TO_FEED; b.stateT = 0; b.stateDur = 6; }
+        }
+      }
+    }
+  }
+}
+function onUp(e) {
+  const st = pointers.get(e.pointerId);
+  if (!st) return;
+  if (!st.dragging) handleTap(st.startX, st.startY);   // a tap
+  pointers.delete(e.pointerId);
+}
+
+canvas.addEventListener("pointerdown", onDown, { passive: false });
+canvas.addEventListener("pointermove", onMove, { passive: false });
+canvas.addEventListener("pointerup", onUp, { passive: false });
+canvas.addEventListener("pointercancel", e => pointers.delete(e.pointerId));
+canvas.addEventListener("pointerleave", e => {
+  // treat leaving mid-tap as a tap; keep drags tidy
+  const st = pointers.get(e.pointerId);
+  if (st && !st.dragging) handleTap(st.startX, st.startY);
+  pointers.delete(e.pointerId);
+});
+
+// block browser gestures that could navigate away
+["gesturestart","gesturechange","gestureend"].forEach(t =>
+  window.addEventListener(t, e => e.preventDefault(), { passive:false }));
+window.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("dblclick", e => e.preventDefault(), { passive:false });
+document.addEventListener("touchmove", e => e.preventDefault(), { passive:false });
+
+/* =========================================================================
+   AMBIENT — random offscreen cluck every few seconds
+   ========================================================================= */
+let ambientT = rand(CONFIG.ambientMin, CONFIG.ambientMax);
+function updateAmbient(dt) {
+  ambientT -= dt;
+  if (ambientT <= 0) {
+    Audio.cluck(0.28);
+    ambientT = rand(CONFIG.ambientMin, CONFIG.ambientMax);
+  }
+}
+
+// Every so often a random hen wanders to the nest box and lays on her own.
+let autoLayT = rand(CONFIG.autoLayMin, CONFIG.autoLayMax);
+function updateAutoLay(dt) {
+  autoLayT -= dt;
+  if (autoLayT > 0) return;
+  autoLayT = rand(CONFIG.autoLayMin, CONFIG.autoLayMax);
+  const avail = [];
+  for (const b of birds) {
+    if (b.type === "hen" &&
+        b.state !== S.STARTLE && b.state !== S.GO_COOP && b.state !== S.LAY)
+      avail.push(b);
+  }
+  if (!avail.length) return;                 // all hens busy -> skip this cycle
+  const b = pick(avail);
+  b.state = S.GO_COOP; b.stateT = 0; b.stateDur = 8; b.job = "lay";
+  b.tx = clamp(YARD.nest.x + YARD.nest.w * 0.5, YARD.walkMinX, YARD.walkMaxX);
+  b.ty = clamp(YARD.nest.y + YARD.nest.h + 14, YARD.walkBack, YARD.walkFront);
+}
+
+/* =========================================================================
+   MAIN LOOP — fixed timestep accumulator; pause when tab hidden.
+   ========================================================================= */
+function update(dt) {
+  updateClouds(dt);
+  updateAmbient(dt);
+  updateAutoLay(dt);
+  updateKernels(dt);
+  updateRipples(dt);
+  updateEggs(dt);
+  updateFlock(dt);
+  updateDust(dt);
+  for (let i = 0; i < birds.length; i++) updateBird(birds[i], dt);
+  // ease the nest lid toward its target (spring-ish)
+  nestLid.open += (nestLid.target - nestLid.open) * Math.min(1, dt * 10);
+}
+
+function draw() {
+  // clear + letterbox
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  ctx.clearRect(0, 0, canvas.width / view.dpr, canvas.height / view.dpr);
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, canvas.width / view.dpr, canvas.height / view.dpr);
+  ctx.save();
+  ctx.translate(view.offX, view.offY);
+  ctx.scale(view.scale, view.scale);
+  // clip to logical frame
+  ctx.beginPath();
+  ctx.rect(0, 0, CONFIG.W, CONFIG.H);
+  ctx.clip();
+
+  // scene, back to front
+  drawSky();
+  drawFlock();
+  drawMountains();
+  drawGrass();
+  drawGround();
+  drawTrough();
+  drawCoop();
+
+  // birds sorted by Y for depth; kernels/dust with them
+  drawKernels();
+  birds.sort((a, b) => a.y - b.y);
+  for (let i = 0; i < birds.length; i++) drawBird(birds[i]);
+  drawDust();
+
+  // fence foreground so birds read as behind it
+  drawFence();
+
+  ctx.restore();
+}
+
+let last = performance.now();
+let acc = 0;
+let running = true;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!running) { last = now; return; }
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > CONFIG.maxFrameDt) dt = CONFIG.maxFrameDt;
+  acc += dt;
+  while (acc >= CONFIG.fixedStep) {
+    update(CONFIG.fixedStep);
+    acc -= CONFIG.fixedStep;
+  }
+  draw();
+}
+
+document.addEventListener("visibilitychange", () => {
+  running = !document.hidden;
+  if (running) last = performance.now();   // avoid a huge catch-up step on resume
+});
+
+/* -------------------------------------------------------------------------
+   Boot
+   ------------------------------------------------------------------------- */
+buildSkyGrad();
+seedStraw();
+initBirds();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
