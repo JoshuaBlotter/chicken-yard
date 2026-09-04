@@ -6,6 +6,8 @@ build step, no dependencies, no network requests. Open `index.html` and it runs.
 
 **Live:** https://joshuablotter.github.io/chicken-yard/
 
+![Chicken Yard](screenshot.jpg)
+
 ## What you can do
 
 - **Tap open ground** — scatter feed; the flock runs over and pecks it up.
@@ -16,6 +18,18 @@ build step, no dependencies, no network requests. Open `index.html` and it runs.
 - **Tap the sky** — a distant flock arcs across the horizon.
 
 No score, no goal, no way to get stuck — just a living yard.
+
+## Install it as an app
+
+It's a PWA, so you can add it to a phone or tablet home screen and it launches
+fullscreen (no browser bar) and runs offline.
+
+- **iPhone / iPad (Safari):** open the live link, tap **Share → Add to Home
+  Screen**. Launch it from the new icon and hold the device **landscape**.
+  (iOS doesn't let web apps lock orientation, so it won't auto-rotate — but the
+  scene letterboxes cleanly in portrait too.)
+- **Android (Chrome):** open the link, then **⋮ menu → Install app / Add to
+  Home screen**. Android honors the landscape hint.
 
 ## Tuning
 
