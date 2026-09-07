@@ -61,7 +61,16 @@
   .chicken .label { background: #F1E4C7; color: #7a4a2a; }
   .duck .label    { background: #CFE9E9; color: #256066; }
   .garden .label  { background: #DCEAC8; color: #4b6b2f; }
-  @media (orientation: portrait) { .cards { flex-direction: column; align-items: center; } a.card { flex: 0 0 auto; width: 100%; } }
+  /* Portrait (phones): stack three compact cards that all fit on screen
+     without scrolling. Size by the smaller of width and height so the whole
+     stack stays inside the viewport on tall iPhones and short phones alike. */
+  @media (orientation: portrait) {
+    body { justify-content: flex-start; gap: 2.5vmin; padding: 4vmin; }
+    h1 { font-size: clamp(18px, 5vmin, 34px); }
+    .cards { flex-direction: column; align-items: center; gap: 2.5vmin; flex-wrap: nowrap; }
+    a.card { flex: 0 0 auto; width: min(74vw, 34vh); min-width: 0; max-width: 320px; border-width: 4px; }
+    a.card .label { padding: 1.6vmin; font-size: clamp(15px, 3.4vmin, 24px); }
+  }
 </style>
 </head>
 <body>
