@@ -410,7 +410,8 @@ function sampleHeight(px, py) {
   const tx = fx - x0, ty = fy - y0, i = y0 * GW + x0;
   const a = cur[i]*(1-tx) + cur[i+1]*tx;
   const b = cur[i+GW]*(1-tx) + cur[i+GW+1]*tx;
-  return a*(1-ty) + b*ty;
+  const r = a*(1-ty) + b*ty;
+  return r === r ? r : 0;   // never hand a NaN to a floating entity
 }
 // Local slope (used for tilt + reflection distortion).
 function sampleGrad(px, py) {
@@ -433,13 +434,20 @@ function inject(px, py, radCells, amp) {
 }
 
 // One fixed-timestep water step: interior masked cells only, then rotate.
+// Neighbours are read from the CURRENT field and the PREVIOUS field is
+// subtracted: f(k+1) = damp * (avg neighbours of f(k) - f(k-1)). Every spatial
+// mode of this scheme decays by sqrt(damp) < 1, so it stays stable no matter
+// how the impulses interfere. (Reading neighbours from `prev` instead makes the
+// checkerboard mode grow ~1.4x/step and the pond blows up to NaN — a black hole.)
+// The finite guard zeroes any value that still manages to overflow, so a stray
+// non-finite cell can never spread or strand the ducks that sample it.
 function stepWater() {
   for (let y = 1; y < GH - 1; y++) {
     let i = y * GW + 1;
     for (let x = 1; x < GW - 1; x++, i++) {
       if (!mask[i]) { next[i] = 0; continue; }
-      let v = (prev[i-1] + prev[i+1] + prev[i-GW] + prev[i+GW]) * 0.5 - cur[i];
-      next[i] = v * damp[i];
+      let v = ((cur[i-1] + cur[i+1] + cur[i-GW] + cur[i+GW]) * 0.5 - prev[i]) * damp[i];
+      next[i] = (v < 1e4 && v > -1e4) ? v : 0;   // kill NaN/Inf before it spreads
     }
   }
   const t = prev; prev = cur; cur = next; next = t;
