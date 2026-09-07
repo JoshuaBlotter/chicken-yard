@@ -8,10 +8,11 @@ network requests. Open `index.html` and pick a toy.
 
 ![Chicken Yard](screenshot.jpg)
 
-Opening the app shows a simple two-button chooser (`index.html`):
+Opening the app shows a simple chooser (`index.html`):
 
 - **🐔 Chicken Yard** → [`chicken-yard.html`](chicken-yard.html)
 - **🦆 Duck Pond** → [`duck-pond.html`](duck-pond.html)
+- **🌱 Grow a Garden** → [`garden.html`](garden.html)
 
 Each toy is a single self-contained file. No score, no goal, no way to get
 stuck — just a living scene that rewards every touch.
@@ -42,6 +43,32 @@ in a wobbly line share the water.
 - **Tap the reeds** — a frog hops out to a lily pad, or a dragonfly lifts off (alternating).
 - **Tap a lily pad** — it dips and springs back, throwing a ring of ripples.
 
+## Grow a Garden
+
+A raised garden bed shown side-on, with a **soil cutaway** below the surface —
+the best part. Every plant is generated from a seeded recursive branching
+function driven by a single growth parameter, so it unfurls organically instead
+of scaling up like a sprite, and no two are alike. The same branching runs
+downward to draw the roots, so you watch a carrot's taproot swell underground
+while its feathery greens grow above. A shared wind field bends the whole bed
+together. Nothing ever wilts, dies, or needs saving.
+
+![Grow a Garden](garden.jpg)
+
+- **Tap the soil** — a seed drops and a plant sprouts, growing over ~5 seconds.
+  Repeated taps rotate through eight kinds (sunflower, carrot, radish, tomato,
+  corn, pumpkin, bean, strawberry).
+- **Drag along the soil** — plant a whole staggered row, each sprouting a beat
+  after the last.
+- **Tap the sky** — a cloud rolls in and rains; growing plants surge, the soil
+  darkens, and a rainbow follows.
+- **Tap the sun** — it pulses warm and every plant leans toward it, then eases back.
+- **Tap a grown plant** — it bounces on a spring and any ripe fruit pops off into
+  the basket at the edge of the bed, then regrows.
+- **Tap a flower** — a bee or butterfly wanders in to visit, then moves on.
+- **Tap below the soil line** — a worm surfaces, wriggles, and burrows back down.
+- **Tap the compost pile** — it puffs and a few volunteer sprouts pop up beside it.
+
 ## Install it as an app
 
 It's a PWA, so you can add it to a phone or tablet home screen and it launches
@@ -64,3 +91,9 @@ order: `waterDamping` (how long ripples live), `tapImpulse` (how big a tap
 splashes), and `wakeStrength` (how strongly a swimming duck's wake pushes the
 surface). If the water sim ever chugs on an older tablet, drop `gridW`/`gridH`
 from 160×90 to 120×68.
+
+For **Grow a Garden**, the three to reach for first are `growSeconds` (how long
+seed→mature takes), `windStrength` (how much the whole bed sways), and
+`rainGrowMult` (how sharply rain speeds growth). To add a ninth plant, add an
+entry to the `SPECS` table reusing an existing `form`, then list it in
+`SPEC_ORDER` — no need to touch the generator.
