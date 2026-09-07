@@ -1,0 +1,1238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Duck Pond</title>
+<!-- Installable web app (Add to Home Screen -> fullscreen, offline) -->
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#58A0A0">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Duck Pond">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #c { display: block; position: fixed; inset: 0; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* =========================================================================
+   DUCK POND — a toddler toy. No goals, no score, no fail state, no text.
+   Single file. No external requests. Vector art + Web Audio only.
+   The water is a real height-field wave simulation; everything floating
+   samples it to bob and tilt so the scene feels like one connected thing.
+   ========================================================================= */
+
+/* -------------------------------------------------------------------------
+   CONFIG — every tunable number lives here. Retune the toy from this block.
+   The three you'll want first are: waterDamping, tapImpulse, wakeStrength.
+   ------------------------------------------------------------------------- */
+const CONFIG = {
+  W: 1280,                 // logical render width (letterboxed to fit)
+  H: 720,                  // logical render height
+  fixedStep: 1/60,         // physics + water timestep (frame-rate independent)
+  maxFrameDt: 0.1,         // clamp big frame gaps (tab wakeups) so we don't spiral
+
+  // --- Water simulation ---------------------------------------------------
+  gridW: 160,              // wave grid columns (drop to 120 if a tablet chugs)
+  gridH: 90,               // wave grid rows    (drop to 68 to match)
+  waterDamping: 0.985,     // <<< energy kept each step in deep water (feel #1)
+  edgeDamping: 0.90,       // stronger damping near shore so waves die, not bounce
+  deepCells: 11,           // cells from shore before water counts as "deep"
+  tapImpulse: 3.4,         // <<< height added by a finger tap (feel #2)
+  dragImpulse: 0.5,        // height added per interpolated drag sample
+  ambientImpulse: 0.5,     // size of the tiny random impulses that keep it alive
+  ambientRate: 3.5,        // ambient impulses per second (surface never dead-flat)
+  impulseRadius: 4,        // Gaussian impulse radius in cells
+  wakeStrength: 0.045,     // <<< height injected behind a swimming duck (feel #3)
+  bobScale: 6.5,           // logical px a floating thing rises per unit wave height
+  tiltScale: 0.06,         // radians a floating thing leans per unit wave gradient
+  specGain: 7.5,           // how sharply slopes catch the sun (specular)
+  specStrength: 0.5,       // brightness of the specular glint
+  crestShade: 0.9,         // brighten wave crests / darken troughs
+
+  // --- Ducks --------------------------------------------------------------
+  drakeCount: 1,           // iridescent-green-headed male
+  henCount: 3,             // mottled brown females (brood leaders)
+  ducklingCount: 5,        // buff-yellow babies that trail a hen in a line
+  turnRate: 2.4,           // radians/sec a duck can swing its heading (boat-like)
+  paddleSpeed: 58,         // logical px/sec when swimming to a target
+  driftSpeed: 10,          // slow idle drift speed
+  ducklingSpeed: 74,       // babies swim a touch faster to keep the line closed
+  ducklingLagSteps: 11,    // fixed-steps of lag between each link of the line
+  ducklingWobble: 7,       // px of side-to-side wobble in the trailing line
+  investigators: 2,        // ducks that turn to investigate a water tap
+
+  // --- Interaction --------------------------------------------------------
+  touchRadius: 90,         // logical hit radius for tapping a duck / prop (generous)
+  dragSpacing: 10,         // px between interpolated impulses along a drag path
+  peaMin: 5, peaMax: 9,    // peas dropped from a tap on the grassy bank
+  peaEatRadius: 26,        // a duck eats a pea within this distance
+
+  // --- Sound --------------------------------------------------------------
+  masterVolume: 0.5,       // overall loudness (0..1)
+  maxVoices: 8,            // hard cap on simultaneous synth voices
+  distantQuackMin: 6, distantQuackMax: 12, // seconds between offscreen quacks
+
+  particleCap: 250,        // hard cap on pooled water droplets
+
+  // Palette — used exactly, never substituted with default web colors.
+  col: {
+    waterDeep:   "#2E6B72", waterShallow: "#58A0A0", waterShore: "#C8B384",
+    specular:    "#EAFBFF",
+    grass:       "#7FA65C", grassDark:    "#5E8244",
+    reedGreen:   "#6B8F3E", cattailBrown: "#7A5230",
+    lilyPad:     "#4E8C4A", lilyFlower:   "#F7F1E3",
+    drakeHead:   "#2E6B4F", drakeBody:    "#9A8A72", drakeBreast: "#7A3B2E",
+    henBrown:    "#A8845C", duckling:     "#E9C96A", bill:        "#E8A33D",
+    log:         "#6E5A45", rock:         "#98938C",
+    sky:         "#BFE3EA", skyLow:       "#DDF0F2",
+    frog:        "#5E8A3A", dragonfly:    "#3A6E8A", pea:         "#8FB84E",
+  },
+};
+
+/* -------------------------------------------------------------------------
+   Canvas + letterbox transform (fixed 1280x720 logical, DPR-aware)
+   ------------------------------------------------------------------------- */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let view = { scale: 1, offX: 0, offY: 0, dpr: 1 };
+
+function fit() {
+  const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+  const cw = window.innerWidth, ch = window.innerHeight;
+  canvas.width = Math.round(cw * dpr);
+  canvas.height = Math.round(ch * dpr);
+  canvas.style.width = cw + "px";
+  canvas.style.height = ch + "px";
+  const scale = Math.min(cw / CONFIG.W, ch / CONFIG.H);
+  view.dpr = dpr;
+  view.scale = scale;
+  view.offX = (cw - CONFIG.W * scale) / 2;
+  view.offY = (ch - CONFIG.H * scale) / 2;
+}
+window.addEventListener("resize", fit);
+window.addEventListener("orientationchange", fit);
+fit();
+
+// Screen (client) -> logical coordinates.
+function toLogical(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (clientX - rect.left - view.offX) / view.scale;
+  const y = (clientY - rect.top  - view.offY) / view.scale;
+  return { x, y };
+}
+
+/* -------------------------------------------------------------------------
+   Tiny helpers
+   ------------------------------------------------------------------------- */
+const rand = (a, b) => a + Math.random() * (b - a);
+const randi = (a, b) => Math.floor(rand(a, b + 1));
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const TAU = Math.PI * 2;
+const easeOut = t => 1 - (1 - t) * (1 - t);
+// short-angle turn: rotate `a` toward `b` by at most `max` radians
+function turnToward(a, b, max) {
+  let d = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI;
+  if (d >  max) d =  max;
+  if (d < -max) d = -max;
+  return a + d;
+}
+function hexRGB(h) {
+  return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
+}
+let TIME = 0; // seconds since boot (advanced on fixed step) — drives sway/hover
+
+/* =========================================================================
+   AUDIO — all synthesized. Master gain + gentle lowpass bus. Voice-capped.
+   Unlocked on the first pointer event.
+   ========================================================================= */
+const Audio = (() => {
+  let ac = null, bus = null, master = null, noiseBuf = null, ambient = null;
+  let voices = 0, ready = false;
+
+  function unlock() {
+    if (ac) { if (ac.state === "suspended") ac.resume(); return; }
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      ac = new AC();
+      master = ac.createGain(); master.gain.value = CONFIG.masterVolume;
+      bus = ac.createBiquadFilter();           // gentle lowpass so tablets aren't harsh
+      bus.type = "lowpass"; bus.frequency.value = 5000; bus.Q.value = 0.3;
+      bus.connect(master); master.connect(ac.destination);
+      const len = ac.sampleRate;                // 1s of noise for splashes/flutters
+      noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      ready = true;
+      startAmbient();
+    } catch (e) { ready = false; }
+    if (ac && ac.state === "suspended") ac.resume();
+  }
+  // grab a per-voice gain if under the cap; null when maxed so mashing can't roar
+  function voice(dur) {
+    if (!ready || voices >= CONFIG.maxVoices) return null;
+    voices++;
+    const g = ac.createGain(); g.connect(bus);
+    setTimeout(() => { voices = Math.max(0, voices - 1); }, (dur + 0.12) * 1000);
+    return g;
+  }
+  function noise() { const s = ac.createBufferSource(); s.buffer = noiseBuf; s.loop = true; return s; }
+
+  // Quack — sawtooth ~300-400Hz through a fast bandpass sweep (nasal formant),
+  // sharp attack, a rasp of noise, pitch jittered +/-15% per call.
+  function quack(vol) {
+    vol = vol == null ? 0.6 : vol;
+    const g = voice(0.24); if (!g) return;
+    const t = ac.currentTime, j = rand(0.85, 1.15);
+    const o = ac.createOscillator(); o.type = "sawtooth";
+    o.frequency.setValueAtTime(360 * j, t);
+    o.frequency.linearRampToValueAtTime(300 * j, t + 0.18);
+    const bp = ac.createBiquadFilter(); bp.type = "bandpass"; bp.Q.value = 6;
+    bp.frequency.setValueAtTime(700 * j, t);
+    bp.frequency.exponentialRampToValueAtTime(1500 * j, t + 0.06);
+    bp.frequency.exponentialRampToValueAtTime(600 * j, t + 0.22);
+    const og = ac.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.exponentialRampToValueAtTime(vol, t + 0.008);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    o.connect(bp); bp.connect(og); og.connect(g);
+    o.start(t); o.stop(t + 0.24);
+    // rasp
+    const n = noise(); const nf = ac.createBiquadFilter();
+    nf.type = "bandpass"; nf.frequency.value = 1200 * j; nf.Q.value = 1;
+    const ng = ac.createGain();
+    ng.gain.setValueAtTime(vol * 0.35, t);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+    n.connect(nf); nf.connect(ng); ng.connect(g);
+    n.start(t); n.stop(t + 0.1);
+  }
+  // Occasionally a 3-quack burst with uneven spacing.
+  function quackMaybeBurst(vol) {
+    quack(vol);
+    if (Math.random() < 0.35) {
+      setTimeout(() => quack(vol * 0.9), rand(130, 200));
+      setTimeout(() => quack(vol * 0.8), rand(320, 460));
+    }
+  }
+  // Duckling peep — short high sine chirp ~1.6kHz bending upward.
+  function peep() {
+    const g = voice(0.12); if (!g) return;
+    const t = ac.currentTime, j = rand(0.9, 1.1);
+    const o = ac.createOscillator(); o.type = "sine";
+    o.frequency.setValueAtTime(1500 * j, t);
+    o.frequency.exponentialRampToValueAtTime(1900 * j, t + 0.08);
+    const og = ac.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.exponentialRampToValueAtTime(0.3, t + 0.01);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.11);
+    o.connect(og); og.connect(g);
+    o.start(t); o.stop(t + 0.12);
+  }
+  // Splash — filtered noise burst with a downward lowpass sweep; size scales
+  // length + brightness so a tap and a wing-flap sound different.
+  function splash(size) {
+    size = clamp(size, 0.2, 1);
+    const dur = 0.12 + size * 0.4;
+    const g = voice(dur); if (!g) return;
+    const t = ac.currentTime;
+    const n = noise(); const lp = ac.createBiquadFilter(); lp.type = "lowpass";
+    lp.frequency.setValueAtTime(1200 + size * 5000, t);
+    lp.frequency.exponentialRampToValueAtTime(500, t + dur);
+    const ng = ac.createGain();
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.exponentialRampToValueAtTime(0.25 + size * 0.35, t + 0.01);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    n.connect(lp); lp.connect(ng); ng.connect(g);
+    n.start(t); n.stop(t + dur + 0.02);
+  }
+  // Plop — very short sine with a fast downward pitch bend (peas, frog).
+  function plop() {
+    const g = voice(0.12); if (!g) return;
+    const t = ac.currentTime, j = rand(0.85, 1.2);
+    const o = ac.createOscillator(); o.type = "sine";
+    o.frequency.setValueAtTime(520 * j, t);
+    o.frequency.exponentialRampToValueAtTime(120 * j, t + 0.09);
+    const og = ac.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.exponentialRampToValueAtTime(0.32, t + 0.005);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 0.1);
+    o.connect(og); og.connect(g);
+    o.start(t); o.stop(t + 0.12);
+  }
+  // Wing flutter — three or four rhythmic noise bursts.
+  function flutter() {
+    const n = randi(3, 4);
+    for (let i = 0; i < n; i++) {
+      setTimeout(() => {
+        const g = voice(0.07); if (!g) return;
+        const t = ac.currentTime;
+        const s = noise(); const bp = ac.createBiquadFilter();
+        bp.type = "bandpass"; bp.frequency.value = rand(300, 600); bp.Q.value = 0.8;
+        const ng = ac.createGain();
+        ng.gain.setValueAtTime(0.0001, t);
+        ng.gain.exponentialRampToValueAtTime(0.22, t + 0.006);
+        ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+        s.connect(bp); bp.connect(ng); ng.connect(g);
+        s.start(t); s.stop(t + 0.07);
+      }, i * rand(70, 110));
+    }
+  }
+  // Ambient — quiet filtered brown noise, slowly amplitude-modulated (lapping).
+  function startAmbient() {
+    if (!ready || ambient) return;
+    const src = noise();
+    const lp = ac.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 420;
+    const g = ac.createGain(); g.gain.value = 0.05;
+    const lfo = ac.createOscillator(); lfo.type = "sine"; lfo.frequency.value = 0.12;
+    const lfoG = ac.createGain(); lfoG.gain.value = 0.03;
+    lfo.connect(lfoG); lfoG.connect(g.gain);
+    src.connect(lp); lp.connect(g); g.connect(bus);
+    src.start(); lfo.start();
+    ambient = { src, lfo };
+  }
+  return { unlock, quack: quackMaybeBurst, quackOne: quack, peep, splash, plop, flutter,
+           get ready() { return ready; } };
+})();
+
+/* =========================================================================
+   POND GEOMETRY — an irregular organic shoreline authored as anchor points,
+   drawn as one smooth closed curve (quadratic midpoint smoothing).
+   ========================================================================= */
+// Water bounding rect the wave grid maps onto.
+const WR = { x: 120, y: 140, w: 1040, h: 540 };
+// Hand-authored shoreline (NOT a circle/ellipse). Logical coordinates.
+const POND = [
+  [180,340],[150,250],[250,185],[420,158],[610,168],[800,150],[985,178],
+  [1120,255],[1150,395],[1085,520],[930,600],[730,650],[520,662],[345,612],
+  [205,505],[168,420],
+];
+// Trace the smooth closed pond outline into the given context.
+function pondPath(c) {
+  const p = POND, n = p.length;
+  c.beginPath();
+  const mx = (p[n-1][0] + p[0][0]) / 2, my = (p[n-1][1] + p[0][1]) / 2;
+  c.moveTo(mx, my);
+  for (let i = 0; i < n; i++) {
+    const a = p[i], b = p[(i + 1) % n];
+    c.quadraticCurveTo(a[0], a[1], (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+  }
+  c.closePath();
+}
+
+/* =========================================================================
+   WATER — height-field wave simulation on a fixed grid.
+   next = (prev neighbours)/2 - cur, damped; buffers rotate each step.
+   Overlapping impulses interfere and cancel like real waves — never clamped.
+   ========================================================================= */
+const GW = CONFIG.gridW, GH = CONFIG.gridH, GN = GW * GH;
+let prev = new Float32Array(GN);   // wave buffers — preallocated, never realloc'd
+let cur  = new Float32Array(GN);
+let next = new Float32Array(GN);
+const mask  = new Uint8Array(GN);      // 1 = this cell is water
+const depth = new Float32Array(GN);    // 0 shore .. 1 deep (static)
+const damp  = new Float32Array(GN);    // per-cell damping (more at the shore)
+const baseR = new Float32Array(GN), baseG = new Float32Array(GN), baseB = new Float32Array(GN);
+
+// Build the water mask + a chamfer distance transform for depth/shore shading.
+(function buildPondFields() {
+  const oc = document.createElement("canvas"); oc.width = GW; oc.height = GH;
+  const octx = oc.getContext("2d");
+  octx.setTransform(GW / WR.w, 0, 0, GH / WR.h, -WR.x * GW / WR.w, -WR.y * GH / WR.h);
+  octx.fillStyle = "#fff"; pondPath(octx); octx.fill();
+  const img = octx.getImageData(0, 0, GW, GH).data;
+  for (let i = 0; i < GN; i++) mask[i] = img[i * 4 + 3] > 128 ? 1 : 0;
+
+  // chamfer distance to nearest non-water cell (two passes)
+  const INF = 1e9, dist = new Float32Array(GN);
+  for (let i = 0; i < GN; i++) dist[i] = mask[i] ? INF : 0;
+  const at = (x, y) => y * GW + x;
+  for (let y = 1; y < GH; y++) for (let x = 1; x < GW; x++) {
+    const i = at(x, y);
+    dist[i] = Math.min(dist[i], dist[at(x-1,y)] + 1, dist[at(x,y-1)] + 1, dist[at(x-1,y-1)] + 1.414);
+  }
+  for (let y = GH-2; y >= 0; y--) for (let x = GW-2; x >= 0; x--) {
+    const i = at(x, y);
+    dist[i] = Math.min(dist[i], dist[at(x+1,y)] + 1, dist[at(x,y+1)] + 1, dist[at(x+1,y+1)] + 1.414);
+  }
+  const deep = [hexRGB(CONFIG.col.waterDeep), hexRGB(CONFIG.col.waterShallow), hexRGB(CONFIG.col.waterShore)];
+  for (let i = 0; i < GN; i++) {
+    const dn = clamp(dist[i] / CONFIG.deepCells, 0, 1);
+    depth[i] = dn;
+    damp[i]  = lerp(CONFIG.edgeDamping, CONFIG.waterDamping, dn);
+    // two-stage colour: shore -> shallow -> deep, plus a faint sky tint up top
+    let r, g, b;
+    if (dn < 0.5) { const t = dn * 2;       r = lerp(deep[2][0],deep[1][0],t); g = lerp(deep[2][1],deep[1][1],t); b = lerp(deep[2][2],deep[1][2],t); }
+    else          { const t = (dn-0.5) * 2; r = lerp(deep[1][0],deep[0][0],t); g = lerp(deep[1][1],deep[0][1],t); b = lerp(deep[1][2],deep[0][2],t); }
+    const skyT = clamp(1 - ((i / GW | 0) / GH) , 0, 1) * 0.12; // brighter toward the far (top) bank
+    baseR[i] = lerp(r, 200, skyT); baseG[i] = lerp(g, 225, skyT); baseB[i] = lerp(b, 230, skyT);
+  }
+})();
+
+// offscreen surface we paint per-cell then scale up smoothly
+const surf = document.createElement("canvas"); surf.width = GW; surf.height = GH;
+const surfCtx = surf.getContext("2d");
+const surfImg = surfCtx.createImageData(GW, GH);
+const surfData = surfImg.data;
+for (let i = 0; i < GN; i++) surfData[i * 4 + 3] = mask[i] ? 255 : 0; // alpha is static
+
+// logical point -> fractional grid coordinates
+function gx(px) { return (px - WR.x) / WR.w * GW; }
+function gy(py) { return (py - WR.y) / WR.h * GH; }
+
+// True if a logical point sits over water.
+function isWater(px, py) {
+  const x = Math.round(gx(px)), y = Math.round(gy(py));
+  if (x < 0 || y < 0 || x >= GW || y >= GH) return false;
+  return mask[y * GW + x] === 1;
+}
+// Bilinear height sample (used for bobbing).
+function sampleHeight(px, py) {
+  const fx = gx(px), fy = gy(py);
+  const x0 = Math.floor(fx), y0 = Math.floor(fy);
+  if (x0 < 0 || y0 < 0 || x0 >= GW - 1 || y0 >= GH - 1) return 0;
+  const tx = fx - x0, ty = fy - y0, i = y0 * GW + x0;
+  const a = cur[i]*(1-tx) + cur[i+1]*tx;
+  const b = cur[i+GW]*(1-tx) + cur[i+GW+1]*tx;
+  return a*(1-ty) + b*ty;
+}
+// Local slope (used for tilt + reflection distortion).
+function sampleGrad(px, py) {
+  const x = clamp(Math.round(gx(px)), 1, GW - 2);
+  const y = clamp(Math.round(gy(py)), 1, GH - 2);
+  const i = y * GW + x;
+  return { gx: cur[i+1] - cur[i-1], gy: cur[i+GW] - cur[i-GW] };
+}
+// Inject a Gaussian impulse (radius in cells) into the current buffer.
+function inject(px, py, radCells, amp) {
+  const cx = Math.round(gx(px)), cy = Math.round(gy(py));
+  const r = Math.ceil(radCells), s2 = 2 * (radCells * 0.6) * (radCells * 0.6);
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+    const x = cx + dx, y = cy + dy;
+    if (x < 1 || y < 1 || x >= GW - 1 || y >= GH - 1) continue;
+    const i = y * GW + x; if (!mask[i]) continue;
+    const d2 = dx*dx + dy*dy; if (d2 > r*r) continue;
+    cur[i] += amp * Math.exp(-d2 / s2);
+  }
+}
+
+// One fixed-timestep water step: interior masked cells only, then rotate.
+function stepWater() {
+  for (let y = 1; y < GH - 1; y++) {
+    let i = y * GW + 1;
+    for (let x = 1; x < GW - 1; x++, i++) {
+      if (!mask[i]) { next[i] = 0; continue; }
+      let v = (prev[i-1] + prev[i+1] + prev[i-GW] + prev[i+GW]) * 0.5 - cur[i];
+      next[i] = v * damp[i];
+    }
+  }
+  const t = prev; prev = cur; cur = next; next = t;
+}
+
+let ambientAcc = 0;
+function updateWater(dt) {
+  stepWater();
+  // constant gentle ambient forcing so the surface is always alive
+  ambientAcc += dt * CONFIG.ambientRate;
+  while (ambientAcc >= 1) {
+    ambientAcc -= 1;
+    inject(rand(WR.x, WR.x + WR.w), rand(WR.y, WR.y + WR.h), 3, rand(0.2, 1) * CONFIG.ambientImpulse);
+  }
+}
+
+// Paint the height field: base colour shifted by slope, plus a specular glint
+// where the surface faces the light. drawn scaled up with smoothing.
+const LX = -0.55, LY = -0.5; // light direction in gradient space (upper-left)
+const SPEC = hexRGB(CONFIG.col.specular);
+function paintWater() {
+  const d = surfData;
+  for (let y = 1; y < GH - 1; y++) {
+    let i = y * GW + 1;
+    for (let x = 1; x < GW - 1; x++, i++) {
+      if (!mask[i]) continue;
+      const gX = cur[i+1] - cur[i-1];
+      const gY = cur[i+GW] - cur[i-GW];
+      const h  = cur[i];
+      // specular: bright where the slope normal tips toward the light.
+      // squared so only steep slopes glint (thin sun-lines, not white blobs).
+      let s = (-gX * LX - gY * LY) * CONFIG.specGain;
+      s = s > 0 ? (s > 1 ? 1 : s) : 0;
+      s = s * s * CONFIG.specStrength;
+      // shade crests up, troughs down; refraction darkens down-slopes a touch.
+      // height + slope are clamped so a big splash tints, never punches to black.
+      const hs = h > 2.5 ? 2.5 : (h < -2.5 ? -2.5 : h);
+      const gc = gY > 2 ? 2 : (gY < -2 ? -2 : gY);
+      const shade = 1 + hs * CONFIG.crestShade * 0.12 - gc * 0.06;
+      const o = i * 4;
+      d[o]   = clamp(baseR[i] * shade + s * SPEC[0], 0, 255);
+      d[o+1] = clamp(baseG[i] * shade + s * SPEC[1], 0, 255);
+      d[o+2] = clamp(baseB[i] * shade + s * SPEC[2], 0, 255);
+    }
+  }
+  surfCtx.putImageData(surfImg, 0, 0);
+}
+
+/* =========================================================================
+   SCENE PROPS — reeds, lily pads (entities), log, rocks, wildflowers.
+   Fixed authored layout for a pleasing composition.
+   ========================================================================= */
+const REEDS = [ // clumps at the left and upper-right shoreline
+  { x: 190, y: 470, stalks: 7, tall: 150, kind: 0 },
+  { x: 1010, y: 210, stalks: 8, tall: 170, kind: 1 },
+];
+const ROCKS = [ // near-shore rocks
+  { x: 300, y: 636, r: 26 }, { x: 355, y: 650, r: 18 },
+  { x: 690, y: 660, r: 30 }, { x: 470, y: 648, r: 16 },
+];
+const LOG = { x: 955, y: 585, w: 220, h: 46, ang: -0.18 }; // half-submerged, lower-right
+const FLOWERS = []; // wildflowers on the top bank, each swaying on its own phase
+for (let i = 0; i < 14; i++)
+  FLOWERS.push({ x: rand(120, 1160), y: rand(40, 130), c: pick(["#F2C14E","#E8829B","#F7F1E3","#C77DFF"]), ph: rand(0, TAU) });
+
+/* =========================================================================
+   ENTITIES — ducks, ducklings, lily pads, peas, droplets, frog, dragonfly.
+   Shared update(dt)/draw() interface. Everything floating reads the height field.
+   ========================================================================= */
+const entities = [];
+const ducks = [];        // adults + ducklings (for AI queries)
+const lilies = [];
+const peas = [];
+
+// --- Droplet particle pool (reused, hard-capped) --------------------------
+const drops = [];
+for (let i = 0; i < CONFIG.particleCap; i++) drops.push({ live: false, x:0,y:0,vx:0,vy:0,z:0,vz:0,r:2 });
+function spawnDrop(x, y, power) {
+  for (let i = 0; i < drops.length; i++) {
+    const p = drops[i];
+    if (p.live) continue;
+    p.live = true; p.x = x; p.y = y; p.z = 0;
+    const a = rand(0, TAU), sp = rand(20, 70) * power;
+    p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp * 0.5;
+    p.vz = rand(90, 160) * power; p.r = rand(1.5, 3.2);
+    return;
+  }
+}
+function updateDrops(dt) {
+  for (let i = 0; i < drops.length; i++) {
+    const p = drops[i]; if (!p.live) continue;
+    p.vz -= 420 * dt;                 // gravity in the fake "z" (height above water)
+    p.z += p.vz * dt; p.x += p.vx * dt; p.y += p.vy * dt;
+    if (p.z <= 0) { p.live = false; if (isWater(p.x, p.y)) inject(p.x, p.y, 2, 0.4); } // landing ripple
+  }
+}
+function drawDrops() {
+  ctx.fillStyle = "rgba(234,251,255,0.85)";
+  for (let i = 0; i < drops.length; i++) {
+    const p = drops[i]; if (!p.live) continue;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y - p.z, p.r, 0, TAU);
+    ctx.fill();
+  }
+}
+
+// --- Lily pads ------------------------------------------------------------
+function makeLily(x, y, r, flower) {
+  return {
+    type: "lily", x, y, r, flower, dip: 0, dipV: 0, ph: rand(0, TAU),
+    update(dt) {
+      // spring back up after being pressed
+      this.dipV += (-this.dip) * 60 * dt; this.dipV *= 0.86; this.dip += this.dipV * dt;
+    },
+    draw() { drawLily(this); },
+  };
+}
+[[350,300,46,true],[520,420,52,false],[705,300,44,false],[865,430,50,true],
+ [600,560,48,false],[430,520,40,false],[835,560,42,false],[960,360,46,false]]
+ .forEach(p => { const L = makeLily(p[0], p[1], p[2], p[3]); lilies.push(L); entities.push(L); });
+
+// --- Peas -----------------------------------------------------------------
+function makePea(x, y) {
+  return {
+    type: "pea", x, y, eaten: false, ph: rand(0, TAU),
+    update() {}, draw() { drawPea(this); },
+  };
+}
+
+// --- Frog / Dragonfly (alternate from a reed tap) -------------------------
+let reedToggle = 0;
+function spawnReedCritter(clump) {
+  reedToggle ^= 1;
+  Audio.plop();
+  if (reedToggle === 0) {
+    // frog: hops out with a plop, swims to a lily pad, then sits
+    const target = pick(lilies);
+    const f = {
+      type: "frog", x: clump.x, y: clump.y + 10, tx: target.x, ty: target.y,
+      heading: 0, t: 0,
+      update(dt) {
+        this.t += dt;
+        const dx = this.tx - this.x, dy = this.ty - this.y, dd = Math.hypot(dx, dy);
+        if (dd > 6) {
+          const sp = 90; this.x += dx / dd * sp * dt; this.y += dy / dd * sp * dt;
+          this.heading = Math.atan2(dy, dx);
+          if (Math.random() < dt * 4 && isWater(this.x, this.y)) inject(this.x, this.y, 2, 0.5);
+        }
+      },
+      draw() { drawFrog(this); },
+    };
+    inject(clump.x, clump.y + 10, 3, 1.4);
+    entities.push(f);
+  } else {
+    // dragonfly: lifts off and hovers away off-screen, then despawns
+    const dir = clump.x < CONFIG.W / 2 ? 1 : -1;
+    const dfly = {
+      type: "dragonfly", x: clump.x, y: clump.y - 20, z: 20, t: 0, dir,
+      vx: dir * rand(50, 80), done: false,
+      update(dt) {
+        this.t += dt; this.x += this.vx * dt;
+        this.z = 40 + Math.sin(this.t * 3) * 12; this.y += Math.sin(this.t * 2.2) * 12 * dt;
+        if (this.x < -40 || this.x > CONFIG.W + 40) this.done = true;
+      },
+      draw() { drawDragonfly(this); },
+    };
+    entities.push(dfly);
+  }
+}
+
+/* -------------------------------------------------------------------------
+   DUCKS — boat-like movement + a state machine, all timers randomized so no
+   two ducks ever sync. Ducklings chain-follow a hen in a wobbly trailing line.
+   ------------------------------------------------------------------------- */
+const S = { DRIFT:"DRIFT", PADDLE:"PADDLE", DABBLE:"DABBLE", PREEN:"PREEN",
+            FLAP:"WING_FLAP", HEADBOB:"HEAD_BOB", HAUL:"HAUL_OUT", ONLOG:"ON_LOG" };
+
+function randomWaterPoint() {
+  for (let i = 0; i < 40; i++) {
+    const x = rand(WR.x + 40, WR.x + WR.w - 40), y = rand(WR.y + 40, WR.y + WR.h - 40);
+    if (isWater(x, y)) return { x, y };
+  }
+  return { x: 640, y: 400 };
+}
+
+function makeDuck(kind, x, y) {
+  const d = {
+    type: "duck", kind, x, y, heading: rand(0, TAU), speed: 0,
+    scale: kind === "duckling" ? 0.42 : (kind === "hen" ? 0.86 : 1),
+    tx: x, ty: y, hasTarget: false,
+    state: S.DRIFT, stateT: 0, stateDur: rand(2, 5),
+    anim: 0,               // 0..1 progress used by transient animations
+    face: 1,               // sprite faces right(+1)/left(-1)
+    hist: [],              // recent positions for duckling chain-following
+    leader: null, lagBase: 0,
+    settle: 0,             // >0 briefly after a flap -> a second tap makes it dabble
+    logSit: 0,             // seconds remaining sitting on the log
+    update(dt) { updateDuck(this, dt); },
+    draw() { drawDuck(this); },
+  };
+  for (let i = 0; i < 200; i++) d.hist.push({ x, y });
+  return d;
+}
+
+// pick the next idle behaviour with per-duck randomized dwell times
+function nextIdleState(d) {
+  if (d.kind === "duckling") { setDuckState(d, S.DRIFT, rand(1.5, 3)); return; }
+  const r = Math.random();
+  if (r < 0.30) { const p = randomWaterPoint(); d.tx = p.x; d.ty = p.y; d.hasTarget = true; setDuckState(d, S.PADDLE, rand(2, 5)); }
+  else if (r < 0.48) setDuckState(d, S.DABBLE, rand(1.2, 2.0));
+  else if (r < 0.64) setDuckState(d, S.PREEN, rand(2, 3.5));
+  else if (r < 0.74) setDuckState(d, S.HEADBOB, rand(1, 1.8));
+  else if (r < 0.80 && d.kind !== "duckling") setDuckState(d, S.FLAP, 1.1);
+  else if (r < 0.86 && d.kind === "drake" && logFree()) { d.tx = LOG.x; d.ty = LOG.y - 4; d.hasTarget = true; setDuckState(d, S.HAUL, 6); }
+  else setDuckState(d, S.DRIFT, rand(2.5, 5));
+}
+function setDuckState(d, s, dur) { d.state = s; d.stateT = 0; d.stateDur = dur; d.anim = 0; }
+function logFree() { for (const q of ducks) if (q.state === S.ONLOG || (q.state === S.HAUL)) return false; return true; }
+
+function updateDuck(d, dt) {
+  d.stateT += dt;
+  if (d.settle > 0) d.settle -= dt;
+
+  // --- desired heading / speed by state ---
+  let targetSpeed = 0;
+  if (d.kind === "duckling") {
+    // chain-follow: sample the leader's position from a moment ago (+ wobble)
+    const lead = d.leader;
+    if (lead) {
+      const h = lead.hist, idx = Math.max(0, h.length - 1 - d.lagBase);
+      const lp = h[idx];
+      const w = Math.sin(TIME * 3 + d.lagBase) * CONFIG.ducklingWobble;
+      d.tx = lp.x + Math.cos(d.heading + Math.PI/2) * w;
+      d.ty = lp.y + Math.sin(d.heading + Math.PI/2) * w;
+    }
+    const dx = d.tx - d.x, dy = d.ty - d.y, dd = Math.hypot(dx, dy);
+    if (dd > 8) { d.heading = turnToward(d.heading, Math.atan2(dy, dx), CONFIG.turnRate * 1.6 * dt); targetSpeed = Math.min(CONFIG.ducklingSpeed, dd * 2.2); }
+    if (Math.random() < dt * 0.25) Audio.peep();
+  } else {
+    switch (d.state) {
+      case S.PADDLE: case S.HAUL: {
+        const dx = d.tx - d.x, dy = d.ty - d.y, dd = Math.hypot(dx, dy);
+        if (dd > (d.state === S.HAUL ? 10 : 24)) {
+          d.heading = turnToward(d.heading, Math.atan2(dy, dx), CONFIG.turnRate * dt);
+          targetSpeed = CONFIG.paddleSpeed;
+        } else if (d.state === S.HAUL) { setDuckState(d, S.ONLOG, rand(4, 8)); d.logSit = d.stateDur; }
+        else { d.hasTarget = false; nextIdleState(d); }
+        break;
+      }
+      case S.DRIFT:
+        if (Math.random() < dt * 0.6) d.heading += rand(-0.5, 0.5);
+        targetSpeed = CONFIG.driftSpeed;
+        break;
+      case S.HEADBOB:
+        if (d.stateT > d.stateDur * 0.4 && d.anim < 0.5) { d.anim = 1; Audio.quack(0.55); }
+        break;
+      case S.FLAP:
+        if (d.anim === 0) { d.anim = 1; Audio.flutter(); Audio.splash(0.7); inject(d.x, d.y, 6, CONFIG.tapImpulse * 0.9);
+          for (let i = 0; i < 10; i++) spawnDrop(d.x, d.y, 1); d.settle = 1.2; }
+        break;
+      case S.DABBLE:
+        // tips bottom-up ~1-2s, then rights with a shake + a spray of droplets
+        if (d.stateT > d.stateDur && d.anim < 0.5) {
+          d.anim = 1; Audio.splash(0.4); inject(d.x, d.y, 4, 1.2);
+          for (let i = 0; i < 8; i++) spawnDrop(d.x, d.y, 0.8);
+        }
+        break;
+      case S.ONLOG:
+        d.logSit -= dt;
+        if (d.logSit <= 0) { // slide back in with a splash
+          Audio.splash(0.6); inject(d.x, d.y, 5, CONFIG.tapImpulse * 0.7);
+          for (let i = 0; i < 8; i++) spawnDrop(d.x, d.y, 0.9);
+          d.hasTarget = false; nextIdleState(d);
+        }
+        break;
+    }
+  }
+
+  // --- integrate boat-like motion (no instant direction changes) ---
+  if (d.state !== S.ONLOG) {
+    d.speed += (targetSpeed - d.speed) * Math.min(1, dt * 3);
+    let nx = d.x + Math.cos(d.heading) * d.speed * dt;
+    let ny = d.y + Math.sin(d.heading) * d.speed * dt;
+    // predictive shoreline avoidance: if the water ahead runs out, turn back in
+    const ax = d.x + Math.cos(d.heading) * 40, ay = d.y + Math.sin(d.heading) * 40;
+    if (!isWater(ax, ay)) {
+      const back = randomWaterPoint(); d.tx = back.x; d.ty = back.y;
+      d.heading = turnToward(d.heading, Math.atan2(back.y - d.y, back.x - d.x), CONFIG.turnRate * 3 * dt);
+      nx = d.x; ny = d.y;
+    }
+    if (isWater(nx, ny)) { d.x = nx; d.y = ny; }
+    // leave a real V-wake behind while moving
+    if (d.speed > 12) {
+      const bx = d.x - Math.cos(d.heading) * 10, by = d.y - Math.sin(d.heading) * 10;
+      inject(bx, by, 3, d.speed * CONFIG.wakeStrength * dt * 60 * 0.02);
+    }
+  }
+
+  if (Math.cos(d.heading) > 0.05) d.face = 1; else if (Math.cos(d.heading) < -0.05) d.face = -1;
+
+  // record position history for the ducklings that chain-follow this duck
+  d.hist.push({ x: d.x, y: d.y });
+  if (d.hist.length > 200) d.hist.shift();
+
+  // transient anim decay
+  if (d.state === S.HEADBOB || d.state === S.FLAP || d.state === S.PREEN) d.anim = Math.min(1, d.anim + dt * 2);
+
+  // idle timeout -> choose the next behaviour
+  if (d.kind !== "duckling" && d.state !== S.PADDLE && d.state !== S.HAUL && d.state !== S.ONLOG && d.stateT >= d.stateDur)
+    nextIdleState(d);
+  if (d.kind === "duckling" && d.stateT >= d.stateDur) setDuckState(d, S.DRIFT, rand(1.5, 3));
+}
+
+// react to a tap on a duck: flap+quack+shake, or dabble if it's already settling
+function pokeDuck(d) {
+  if (d.settle > 0) { setDuckState(d, S.DABBLE, rand(1.2, 1.8)); }
+  else { setDuckState(d, S.FLAP, 1.1); Audio.quack(0.7); }
+  // nearby ducks turn to look
+  for (const q of ducks) {
+    if (q === d) continue;
+    if (Math.hypot(q.x - d.x, q.y - d.y) < 180) q.heading = Math.atan2(d.y - q.y, d.x - q.x);
+  }
+}
+
+/* -------------------------------------------------------------------------
+   Build the flock + assign the duckling line.
+   ------------------------------------------------------------------------- */
+let drakeRef = null; const hens = [];
+(function initFlock() {
+  for (let i = 0; i < CONFIG.drakeCount; i++) { const p = randomWaterPoint(); const d = makeDuck("drake", p.x, p.y); drakeRef = d; ducks.push(d); entities.push(d); }
+  for (let i = 0; i < CONFIG.henCount; i++)  { const p = randomWaterPoint(); const d = makeDuck("hen", p.x, p.y); hens.push(d); ducks.push(d); entities.push(d); }
+  let prevLink = null;
+  for (let i = 0; i < CONFIG.ducklingCount; i++) {
+    const lead = hens[0] || drakeRef; const p = { x: lead.x - (i+1)*18, y: lead.y + rand(-8,8) };
+    const d = makeDuck("duckling", p.x, p.y);
+    d.leader = prevLink || lead;         // chain: first follows the hen, rest follow each other
+    d.lagBase = CONFIG.ducklingLagSteps;
+    prevLink = d; ducks.push(d); entities.push(d);
+  }
+})();
+// occasionally re-point the head of the duckling line at the nearest hen
+let broodTimer = 0;
+function updateBrood(dt) {
+  broodTimer -= dt; if (broodTimer > 0) return; broodTimer = 1.5;
+  const head = ducks.find(d => d.kind === "duckling" && d.leader && d.leader.kind !== "duckling");
+  if (!head) return;
+  let best = null, bd = 1e9;
+  for (const h of hens) { const dd = Math.hypot(h.x - head.x, h.y - head.y); if (dd < bd) { bd = dd; best = h; } }
+  if (best && !fingerDragTarget) head.leader = best;
+}
+
+/* =========================================================================
+   DRAWING — every function notes what it renders. Vector paths only.
+   ========================================================================= */
+// The far bank + grass ring around the pond, with swaying wildflowers.
+function drawBank() {
+  const c = CONFIG.col;
+  // grass fills the whole frame; the pond is painted on top
+  const g = ctx.createLinearGradient(0, 0, 0, CONFIG.H);
+  g.addColorStop(0, c.grassDark); g.addColorStop(0.35, c.grass); g.addColorStop(1, c.grassDark);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+  // a soft darker rim just outside the shoreline
+  ctx.save(); pondPath(ctx); ctx.lineWidth = 26; ctx.strokeStyle = "rgba(70,100,50,0.5)"; ctx.stroke(); ctx.restore();
+  // wildflowers on the top bank
+  for (const f of FLOWERS) {
+    const sway = Math.sin(TIME * 1.3 + f.ph) * 4;
+    ctx.strokeStyle = c.grassDark; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(f.x, f.y + 14); ctx.quadraticCurveTo(f.x + sway*0.5, f.y + 4, f.x + sway, f.y); ctx.stroke();
+    ctx.fillStyle = f.c;
+    for (let k = 0; k < 5; k++) { const a = f.ph + k / 5 * TAU; ctx.beginPath(); ctx.arc(f.x + sway + Math.cos(a)*4, f.y + Math.sin(a)*4, 2.6, 0, TAU); ctx.fill(); }
+    ctx.fillStyle = "#F2C14E"; ctx.beginPath(); ctx.arc(f.x + sway, f.y, 2.4, 0, TAU); ctx.fill();
+  }
+}
+
+// The water: shore-gradient base + the simulated surface, clipped to the pond.
+function drawWater() {
+  ctx.save();
+  pondPath(ctx); ctx.clip();
+  // base wash in case the scaled surface feathers at the very edge
+  const rg = ctx.createRadialGradient(640, 400, 40, 640, 400, 620);
+  rg.addColorStop(0, CONFIG.col.waterDeep); rg.addColorStop(0.7, CONFIG.col.waterShallow); rg.addColorStop(1, CONFIG.col.waterShore);
+  ctx.fillStyle = rg; ctx.fillRect(WR.x, WR.y, WR.w, WR.h);
+  // the live surface, scaled up with smoothing
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(surf, WR.x, WR.y, WR.w, WR.h);
+  // reed reflections: faint vertical streaks wobbled by the local slope
+  drawReedReflections();
+  ctx.restore();
+}
+// Wavy reflected stripes below each reed clump (distorted by the wave gradient).
+function drawReedReflections() {
+  ctx.globalAlpha = 0.16;
+  for (const r of REEDS) {
+    for (let s = 0; s < r.stalks; s++) {
+      const bx = r.x + (s - r.stalks / 2) * 12;
+      ctx.strokeStyle = CONFIG.col.reedGreen; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(bx, r.y);
+      for (let t = 0; t <= 6; t++) {
+        const yy = r.y + t * 14;
+        const g = sampleGrad(bx, yy);
+        ctx.lineTo(bx + g.gx * 40 + Math.sin(TIME * 2 + s) * 4, yy);
+      }
+      ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// A reed/cattail clump; each stalk sways on its own slow sine offset.
+function drawReeds(r) {
+  const c = CONFIG.col;
+  for (let s = 0; s < r.stalks; s++) {
+    const bx = r.x + (s - r.stalks / 2) * 12;
+    const sway = Math.sin(TIME * 0.8 + s * 0.9) * 10;
+    ctx.strokeStyle = c.reedGreen; ctx.lineWidth = 4; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(bx, r.y);
+    ctx.quadraticCurveTo(bx + sway * 0.5, r.y - r.tall * 0.6, bx + sway, r.y - r.tall);
+    ctx.stroke();
+    if (r.kind === 1 && s % 2 === 0) { // cattail heads on the tall clump
+      ctx.fillStyle = c.cattailBrown;
+      ctx.beginPath(); ctx.ellipse(bx + sway, r.y - r.tall, 5, 16, 0, 0, TAU); ctx.fill();
+    } else {                           // slim leaf tips on the rest
+      ctx.strokeStyle = c.grassDark; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(bx + sway, r.y - r.tall); ctx.lineTo(bx + sway + 6, r.y - r.tall - 12); ctx.stroke();
+    }
+  }
+}
+
+// A lily pad: a notched circle with veins; it bobs on the water and dips when tapped.
+function drawLily(L) {
+  const h = sampleHeight(L.x, L.y), g = sampleGrad(L.x, L.y);
+  const y = L.y + h * CONFIG.bobScale + L.dip * 10;
+  const r = L.r * (1 - L.dip * 0.12);
+  ctx.save();
+  ctx.translate(L.x, y); ctx.rotate(g.gx * CONFIG.tiltScale);
+  // shadow on the water
+  ctx.fillStyle = "rgba(0,0,0,0.12)"; ctx.beginPath(); ctx.ellipse(3, 5, r, r * 0.7, 0, 0, TAU); ctx.fill();
+  // pad with a wedge notch
+  const notch = L.ph;
+  ctx.fillStyle = CONFIG.col.lilyPad;
+  ctx.beginPath(); ctx.arc(0, 0, r, notch + 0.4, notch - 0.4 + TAU); ctx.lineTo(0, 0); ctx.closePath(); ctx.fill();
+  // veins
+  ctx.strokeStyle = "rgba(30,70,30,0.35)"; ctx.lineWidth = 1.2;
+  for (let k = 0; k < 6; k++) { const a = notch + 0.6 + k / 6 * (TAU - 0.8); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * r * 0.9, Math.sin(a) * r * 0.9); ctx.stroke(); }
+  if (L.flower) { // a white cup flower
+    ctx.fillStyle = CONFIG.col.lilyFlower;
+    for (let k = 0; k < 6; k++) { const a = k / 6 * TAU; ctx.beginPath(); ctx.ellipse(Math.cos(a)*6, Math.sin(a)*6, 5, 9, a, 0, TAU); ctx.fill(); }
+    ctx.fillStyle = "#F2C14E"; ctx.beginPath(); ctx.arc(0, 0, 4, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// A floating pea, bobbing on the surface.
+function drawPea(p) {
+  const h = sampleHeight(p.x, p.y);
+  ctx.fillStyle = CONFIG.col.pea;
+  ctx.beginPath(); ctx.arc(p.x, p.y + h * CONFIG.bobScale, 5, 0, TAU); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,0.4)";
+  ctx.beginPath(); ctx.arc(p.x - 1.5, p.y + h * CONFIG.bobScale - 1.5, 1.6, 0, TAU); ctx.fill();
+}
+
+// The half-submerged log with an above-water top and rings on the cut end.
+function drawLog() {
+  const c = CONFIG.col;
+  ctx.save(); ctx.translate(LOG.x, LOG.y); ctx.rotate(LOG.ang);
+  ctx.fillStyle = "rgba(0,0,0,0.15)"; ctx.beginPath(); ctx.ellipse(0, 8, LOG.w/2+6, LOG.h/2+6, 0, 0, TAU); ctx.fill();
+  ctx.fillStyle = c.log; ctx.beginPath(); ctx.ellipse(0, 0, LOG.w/2, LOG.h/2, 0, 0, TAU); ctx.fill();
+  ctx.strokeStyle = "rgba(40,30,20,0.4)"; ctx.lineWidth = 2;
+  for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.moveTo(i*30, -LOG.h/2*0.7); ctx.lineTo(i*30, LOG.h/2*0.7); ctx.stroke(); }
+  // cut-end rings
+  ctx.fillStyle = "#8A745A"; ctx.beginPath(); ctx.ellipse(-LOG.w/2, 0, 10, LOG.h/2, 0, 0, TAU); ctx.fill();
+  ctx.strokeStyle = "rgba(60,45,30,0.5)";
+  for (let k = 1; k <= 3; k++) { ctx.beginPath(); ctx.ellipse(-LOG.w/2, 0, 3*k, LOG.h/2*k/3.2, 0, 0, TAU); ctx.stroke(); }
+  ctx.restore();
+}
+
+// Near-shore rocks.
+function drawRocks() {
+  for (const r of ROCKS) {
+    ctx.fillStyle = "rgba(0,0,0,0.12)"; ctx.beginPath(); ctx.ellipse(r.x, r.y + r.r*0.5, r.r, r.r*0.5, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = CONFIG.col.rock; ctx.beginPath(); ctx.ellipse(r.x, r.y, r.r, r.r*0.8, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.15)"; ctx.beginPath(); ctx.ellipse(r.x - r.r*0.3, r.y - r.r*0.3, r.r*0.4, r.r*0.3, 0, 0, TAU); ctx.fill();
+  }
+}
+
+// The frog, sitting/swimming low in the water.
+function drawFrog(f) {
+  const h = sampleHeight(f.x, f.y);
+  ctx.save(); ctx.translate(f.x, f.y + h * CONFIG.bobScale);
+  ctx.scale(f.heading > Math.PI/2 || f.heading < -Math.PI/2 ? -1 : 1, 1);
+  ctx.fillStyle = CONFIG.col.frog;
+  ctx.beginPath(); ctx.ellipse(0, 0, 14, 9, 0, 0, TAU); ctx.fill();          // body
+  ctx.beginPath(); ctx.ellipse(11, -4, 6, 5, 0, 0, TAU); ctx.fill();         // head
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(13, -8, 2.4, 0, TAU); ctx.arc(9, -8, 2.4, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#111"; ctx.beginPath(); ctx.arc(13, -8, 1.2, 0, TAU); ctx.arc(9, -8, 1.2, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+// The dragonfly, hovering above the water.
+function drawDragonfly(f) {
+  ctx.save(); ctx.translate(f.x, f.y - f.z);
+  ctx.strokeStyle = CONFIG.col.dragonfly; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(-2*f.dir, 0); ctx.lineTo(-16*f.dir, 2); ctx.stroke(); // body
+  ctx.fillStyle = "rgba(200,240,255,0.55)";
+  const wb = Math.sin(TIME * 40) * 6;
+  ctx.beginPath(); ctx.ellipse(0, -4, 12, 3, wb*0.02, 0, TAU); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0, 4, 12, 3, -wb*0.02, 0, TAU); ctx.fill();
+  ctx.fillStyle = CONFIG.col.dragonfly; ctx.beginPath(); ctx.arc(2*f.dir, 0, 3, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+// A duck, built from primitives. Reads the height field to bob + tilt.
+function drawDuck(d) {
+  const onLog = d.state === S.ONLOG;
+  const h = onLog ? 0 : sampleHeight(d.x, d.y);
+  const g = onLog ? { gx: 0, gy: 0 } : sampleGrad(d.x, d.y);
+  const y = d.y + h * CONFIG.bobScale - (onLog ? 6 : 0);
+  const pal = d.kind === "drake" ? { body: CONFIG.col.drakeBody, head: CONFIG.col.drakeHead, breast: CONFIG.col.drakeBreast }
+            : d.kind === "hen"   ? { body: CONFIG.col.henBrown, head: CONFIG.col.henBrown, breast: CONFIG.col.henBrown }
+            :                      { body: CONFIG.col.duckling, head: CONFIG.col.duckling, breast: CONFIG.col.duckling };
+  const dabbling = d.state === S.DABBLE && d.anim < 0.5;
+  const dabbleP = dabbling ? Math.sin(clamp(d.stateT / d.stateDur, 0, 1) * Math.PI) : 0;
+
+  ctx.save();
+  ctx.translate(d.x, y);
+  ctx.rotate(g.gx * CONFIG.tiltScale);
+  ctx.scale(d.face * d.scale, d.scale);
+
+  // waterline shadow / reflection
+  ctx.fillStyle = "rgba(0,0,0,0.10)";
+  ctx.beginPath(); ctx.ellipse(0, 14, 30, 8, 0, 0, TAU); ctx.fill();
+
+  if (dabbling) {
+    // DABBLE — tail straight up, head underwater. The funniest thing ducks do.
+    ctx.fillStyle = pal.body;
+    ctx.beginPath(); ctx.ellipse(0, 4, 26, 18, 0, 0, TAU); ctx.fill();          // rump at the surface
+    ctx.save(); ctx.rotate(-0.5 - dabbleP * 0.3);
+    ctx.fillStyle = pal.body; ctx.beginPath(); ctx.moveTo(6, -6); ctx.quadraticCurveTo(30, -30 - dabbleP*10, 40, -46 - dabbleP*12);
+    ctx.quadraticCurveTo(46, -34, 20, -8); ctx.closePath(); ctx.fill();          // tail pointing skyward
+    if (d.kind === "drake") { ctx.strokeStyle = pal.head; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(36, -44); ctx.quadraticCurveTo(48, -50, 42, -40); ctx.stroke(); }
+    ctx.restore();
+    ctx.restore();
+    return;
+  }
+
+  // body
+  ctx.fillStyle = pal.body;
+  ctx.beginPath(); ctx.ellipse(0, 2, 30, 20, 0, 0, TAU); ctx.fill();
+  // breast tint (drake) at the front
+  if (d.kind === "drake") { ctx.fillStyle = pal.breast; ctx.beginPath(); ctx.ellipse(16, 2, 16, 16, 0, 0, TAU); ctx.fill(); }
+  // hen mottling
+  if (d.kind === "hen") { ctx.fillStyle = "rgba(90,60,35,0.35)"; for (let k = 0; k < 6; k++) { ctx.beginPath(); ctx.arc(rand(-18,18), rand(-8,10), 3, 0, TAU); ctx.fill(); } }
+
+  // folded wing
+  ctx.fillStyle = d.kind === "duckling" ? "rgba(180,150,70,0.6)" : "rgba(0,0,0,0.12)";
+  const wingLift = d.state === S.PREEN ? Math.sin(d.stateT * 12) * 3 : 0;
+  ctx.beginPath(); ctx.ellipse(-6, 0 - wingLift, 18, 12, -0.2, 0, TAU); ctx.fill();
+  if (d.kind === "drake") { ctx.strokeStyle = "#3A6FB0"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-16, 2); ctx.lineTo(2, -2); ctx.stroke(); } // speculum hint
+
+  // WING_FLAP — both wings beat, rearing up
+  if (d.state === S.FLAP) {
+    const fl = Math.sin(d.stateT * 22) * 0.7;
+    ctx.fillStyle = d.kind === "drake" ? pal.body : "rgba(255,255,255,0.5)";
+    ctx.save(); ctx.rotate(-0.5 + fl); ctx.beginPath(); ctx.ellipse(-6, -20, 22, 9, 0, 0, TAU); ctx.fill(); ctx.restore();
+    ctx.save(); ctx.rotate(-0.5 - fl); ctx.beginPath(); ctx.ellipse(-6, -20, 22, 9, 0, 0, TAU); ctx.fill(); ctx.restore();
+  }
+
+  // curled tail (drake) or plain tail
+  ctx.fillStyle = pal.body;
+  ctx.beginPath(); ctx.moveTo(-28, -2); ctx.quadraticCurveTo(-42, -6, -40, 2); ctx.quadraticCurveTo(-34, 4, -28, 6); ctx.closePath(); ctx.fill();
+  if (d.kind === "drake") { ctx.strokeStyle = pal.head; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(-40, -2); ctx.quadraticCurveTo(-48, -10, -42, -12); ctx.stroke(); }
+
+  // neck + head (head bobs in HEAD_BOB; turns back in PREEN)
+  const bob = d.state === S.HEADBOB ? Math.abs(Math.sin(d.stateT * 10)) * 8 : 0;
+  const preen = d.state === S.PREEN ? clamp(d.anim, 0, 1) : 0;
+  ctx.save();
+  ctx.translate(22, -8);
+  if (preen > 0) ctx.rotate(preen * 2.4); // head swings back toward the wing
+  ctx.translate(0, bob);
+  ctx.fillStyle = pal.body; ctx.beginPath(); ctx.moveTo(-6, 10); ctx.quadraticCurveTo(-2, -4, 4, -8); ctx.lineTo(8, 0); ctx.quadraticCurveTo(2, 6, 0, 12); ctx.closePath(); ctx.fill(); // neck
+  ctx.fillStyle = pal.head; ctx.beginPath(); ctx.arc(6, -10, d.kind === "duckling" ? 9 : 11, 0, TAU); ctx.fill(); // head
+  if (d.kind === "drake") { ctx.fillStyle = "rgba(255,255,255,0.14)"; ctx.beginPath(); ctx.arc(3, -13, 5, 0, TAU); ctx.fill(); } // iridescent sheen
+  // bill
+  ctx.fillStyle = CONFIG.col.bill;
+  ctx.beginPath(); ctx.ellipse(16, -9, 9, 4.5, -0.1, 0, TAU); ctx.fill();
+  // eye + highlight
+  ctx.fillStyle = "#1b1b1b"; ctx.beginPath(); ctx.arc(9, -12, 2.2, 0, TAU); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(9.7, -12.7, 0.8, 0, TAU); ctx.fill();
+  ctx.restore();
+
+  // webbed feet + waddle when hauled out on the log
+  if (onLog) {
+    ctx.fillStyle = CONFIG.col.bill;
+    const wad = Math.sin(TIME * 4) * 2;
+    ctx.beginPath(); ctx.moveTo(-4, 20); ctx.lineTo(-10, 28 + wad); ctx.lineTo(2, 28 + wad); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(10, 20); ctx.lineTo(4, 28 - wad); ctx.lineTo(16, 28 - wad); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* =========================================================================
+   INPUT — Pointer Events, up to 5 simultaneous pointers. Taps interpret the
+   scene; drags carve a wake and lead the ducklings.
+   ========================================================================= */
+const pointers = new Map();      // pointerId -> { x, y, moved, isDrag }
+let fingerDragTarget = null;     // latest on-water drag point the ducklings chase
+
+function nearestReed(x, y) {
+  for (const r of REEDS) if (Math.hypot(r.x - x, r.y - (r.y - r.tall*0.4)) < 120 || Math.hypot(r.x - x, r.y - y) < 130) return r;
+  return null;
+}
+function hitDuck(x, y) {
+  let best = null, bd = CONFIG.touchRadius;
+  for (const d of ducks) { const dd = Math.hypot(d.x - x, d.y - y); if (dd < bd) { bd = dd; best = d; } }
+  return best;
+}
+function hitLily(x, y) {
+  for (const L of lilies) if (Math.hypot(L.x - x, L.y - y) < L.r + 20) return L;
+  return null;
+}
+// nearest point on the shoreline to drop peas beside
+function nearestShore(x, y) {
+  let bx = x, by = y, bd = 1e9;
+  for (const p of POND) { const dd = Math.hypot(p[0]-x, p[1]-y); if (dd < bd) { bd = dd; bx = p[0]; by = p[1]; } }
+  // nudge inward toward the pond centre so peas land on water
+  const cx = 640, cy = 400; const a = Math.atan2(cy - by, cx - bx);
+  return { x: bx + Math.cos(a) * 40, y: by + Math.sin(a) * 40 };
+}
+
+function onDown(x, y) {
+  Audio.unlock();
+  const duck = hitDuck(x, y);
+  if (duck) { pokeDuck(duck); return; }
+  const lily = hitLily(x, y);
+  if (lily) { lily.dipV -= 3.2; inject(lily.x, lily.y, 5, 1.6); Audio.plop(); return; }
+  const reed = nearestReed(x, y);
+  if (reed && Math.hypot(reed.x - x, reed.y - y) < 130) { spawnReedCritter(reed); return; }
+  if (!isWater(x, y)) { // grassy bank -> drop peas near the shore
+    const s = nearestShore(x, y);
+    const n = randi(CONFIG.peaMin, CONFIG.peaMax);
+    for (let i = 0; i < n; i++) {
+      const px = s.x + rand(-40, 40), py = s.y + rand(-30, 30);
+      if (!isWater(px, py)) continue;
+      const pea = makePea(px, py); peas.push(pea); entities.push(pea);
+      inject(px, py, 2, 0.8); Audio.plop();
+    }
+    // every duck converges on the peas
+    for (const d of ducks) if (d.kind !== "duckling" && peas.length) { const t = pick(peas); d.tx = t.x; d.ty = t.y; d.hasTarget = true; setDuckState(d, S.PADDLE, 6); }
+    return;
+  }
+  // plain water tap -> impulse + the nearest ducks investigate
+  inject(x, y, CONFIG.impulseRadius, CONFIG.tapImpulse);
+  Audio.splash(0.3);
+  const sorted = ducks.filter(d => d.kind !== "duckling").sort((a, b) => Math.hypot(a.x-x,a.y-y) - Math.hypot(b.x-x,b.y-y));
+  for (let i = 0; i < Math.min(CONFIG.investigators, sorted.length); i++) { const d = sorted[i]; d.tx = x; d.ty = y; d.hasTarget = true; setDuckState(d, S.PADDLE, 5); }
+}
+
+// drag: interpolate impulses along the path so the wake never drops points
+function onMove(p, x, y) {
+  const dx = x - p.x, dy = y - p.y, dist = Math.hypot(dx, dy);
+  if (dist > 3) p.isDrag = true;
+  if (p.isDrag && isWater(x, y)) {
+    const steps = Math.max(1, Math.floor(dist / CONFIG.dragSpacing));
+    for (let i = 1; i <= steps; i++) {
+      const ix = p.x + dx * i / steps, iy = p.y + dy * i / steps;
+      if (isWater(ix, iy)) inject(ix, iy, 3, CONFIG.dragImpulse);
+    }
+    fingerDragTarget = { x, y };
+    // lead the duckling line with the finger
+    const head = ducks.find(d => d.kind === "duckling" && d.leader && d.leader.kind !== "duckling");
+    if (head) { head._fingerLead = fingerDragTarget; }
+  }
+  p.x = x; p.y = y;
+}
+
+canvas.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  if (pointers.size >= 5) return;
+  const l = toLogical(e.clientX, e.clientY);
+  pointers.set(e.pointerId, { x: l.x, y: l.y, isDrag: false });
+  onDown(l.x, l.y);
+}, { passive: false });
+canvas.addEventListener("pointermove", e => {
+  const p = pointers.get(e.pointerId); if (!p) return;
+  e.preventDefault();
+  const l = toLogical(e.clientX, e.clientY);
+  onMove(p, l.x, l.y);
+}, { passive: false });
+function endPointer(e) {
+  const p = pointers.get(e.pointerId); if (!p) return;
+  pointers.delete(e.pointerId);
+  if (pointers.size === 0) fingerDragTarget = null;
+}
+canvas.addEventListener("pointerup", endPointer);
+canvas.addEventListener("pointercancel", endPointer);
+canvas.addEventListener("pointerout", endPointer);
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+window.addEventListener("dblclick", e => e.preventDefault());
+
+// If a finger is leading the line, override the head duckling's target.
+function applyFingerLead() {
+  const head = ducks.find(d => d.kind === "duckling" && d.leader && d.leader.kind !== "duckling");
+  if (head && fingerDragTarget) { head.tx = fingerDragTarget.x; head.ty = fingerDragTarget.y; head._usingFinger = true; }
+}
+
+/* =========================================================================
+   PEA CONSUMPTION — ducks dip their bills and eat peas they reach.
+   ========================================================================= */
+function updatePeas(dt) {
+  for (const d of ducks) {
+    if (d.kind === "duckling") continue;
+    for (const p of peas) {
+      if (p.eaten) continue;
+      if (Math.hypot(p.x - d.x, p.y - d.y) < CONFIG.peaEatRadius) {
+        p.eaten = true; inject(p.x, p.y, 2, 0.6); Audio.plop();
+        if (d.state !== S.HEADBOB) setDuckState(d, S.HEADBOB, 0.8);
+      }
+    }
+  }
+  for (let i = peas.length - 1; i >= 0; i--) if (peas[i].eaten) { const idx = entities.indexOf(peas[i]); if (idx >= 0) entities.splice(idx, 1); peas.splice(i, 1); }
+}
+
+/* =========================================================================
+   MAIN LOOP — one RAF, fixed-timestep accumulator; pause when tab hidden.
+   ========================================================================= */
+let distantAcc = rand(CONFIG.distantQuackMin, CONFIG.distantQuackMax);
+function update(dt) {
+  TIME += dt;
+  updateWater(dt);
+  updateBrood(dt);
+  applyFingerLead();
+  for (let i = entities.length - 1; i >= 0; i--) {
+    const e = entities[i];
+    e.update(dt);
+    if (e.type === "dragonfly" && e.done) entities.splice(i, 1);
+  }
+  updateDrops(dt);
+  updatePeas(dt);
+  // distant offscreen quack every 6-12s
+  distantAcc -= dt;
+  if (distantAcc <= 0) { distantAcc = rand(CONFIG.distantQuackMin, CONFIG.distantQuackMax); Audio.quackOne(0.28); }
+}
+
+function draw() {
+  // clear + letterbox
+  ctx.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);
+  ctx.clearRect(0, 0, canvas.width / view.dpr, canvas.height / view.dpr);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width / view.dpr, canvas.height / view.dpr);
+  ctx.save();
+  ctx.translate(view.offX, view.offY);
+  ctx.scale(view.scale, view.scale);
+  ctx.beginPath(); ctx.rect(0, 0, CONFIG.W, CONFIG.H); ctx.clip();
+
+  paintWater();          // refresh the surface texture
+  drawBank();            // grass + wildflowers behind everything
+  drawWater();           // the pond itself
+  drawRocks();
+
+  // floating things sorted back-to-front by y so overlaps read correctly
+  const floaters = entities.slice().sort((a, b) => (a.y || 0) - (b.y || 0));
+  // lily pads first (ducks sit above them), then the rest
+  for (const e of floaters) if (e.type === "lily") e.draw();
+  drawLog();
+  for (const e of floaters) if (e.type !== "lily") e.draw();
+  drawDrops();
+
+  // reeds last so ducks read as being on the water in front of the near clump
+  for (const r of REEDS) drawReeds(r);
+
+  ctx.restore();
+}
+
+let last = performance.now(), acc = 0, running = true;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (!running) { last = now; return; }
+  let dt = (now - last) / 1000; last = now;
+  if (dt > CONFIG.maxFrameDt) dt = CONFIG.maxFrameDt;
+  acc += dt;
+  while (acc >= CONFIG.fixedStep) { update(CONFIG.fixedStep); acc -= CONFIG.fixedStep; }
+  draw();
+}
+document.addEventListener("visibilitychange", () => { running = !document.hidden; if (running) last = performance.now(); });
+
+/* -------------------------------------------------------------------------
+   Boot
+   ------------------------------------------------------------------------- */
+requestAnimationFrame(frame);
+
+// register service worker for offline / installed-app use (ignored on file://)
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+  window.addEventListener("load", () => { navigator.serviceWorker.register("sw.js").catch(() => {}); });
+}
+</script>
+</body>
+</html>

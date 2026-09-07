@@ -1,7 +1,7 @@
 {
-  "name": "Chicken Yard",
-  "short_name": "Chickens",
-  "description": "A tap-anywhere backyard chicken toy for toddlers.",
+  "name": "Barnyard Toys",
+  "short_name": "Barnyard",
+  "description": "Tap-anywhere toddler toys: a backyard chicken yard and a duck pond.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
