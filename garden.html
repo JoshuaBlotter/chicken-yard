@@ -1,0 +1,1665 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Grow a Garden</title>
+<!-- Installable web app (Add to Home Screen -> fullscreen, offline) -->
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#5C8F3A">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Garden">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    touch-action: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #c { display: block; position: fixed; inset: 0; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* =========================================================================
+   GROW A GARDEN — a toddler toy. No goal, no score, no timer, no failure.
+   Single self-contained file. No external requests, no images, no fonts.
+   All art is procedural Canvas 2D; all sound is synthesized Web Audio.
+   No emoji, no on-screen text.
+
+   The star is PROCEDURAL PLANT GROWTH: every plant is generated from a
+   seeded recursive builder driven by one growth parameter g (0..1), so the
+   same (type, seed, g) always yields the exact same geometry. A shared wind
+   field bends every plant so the garden reads as one living place.
+   ========================================================================= */
+
+/* -------------------------------------------------------------------------
+   CONFIG — every tunable number lives here, each with a one-line note.
+   The three you'll want to tune first:
+     growSeconds  — how long seed -> mature takes (patience vs. payoff)
+     windStrength — how much the whole garden sways
+     rainGrowMult — how sharply rain accelerates growing plants
+   ------------------------------------------------------------------------- */
+const CONFIG = {
+  W: 1280,                  // logical render width (letterboxed to fit screen)
+  H: 720,                   // logical render height
+  soilFrac: 0.62,           // soil line as fraction down the screen
+  fixedStep: 1 / 60,        // fixed simulation timestep (frame-rate independent)
+  maxFrameDt: 0.1,          // clamp huge frame gaps (tab wakeups) so we don't spiral
+
+  growSeconds: 5.0,         // <<< seed -> mature duration in seconds (feel #1)
+  maxPlants: 14,            // soft cap; a 15th plant retires the oldest gently
+  touchRadius: 90,          // logical hit radius for tapping plants/flowers/sun
+
+  windStrength: 26,         // <<< peak horizontal sway in px at a plant's tip (feel #2)
+  windFreqA: 0.55,          // slow gust frequency
+  windFreqB: 1.30,          // faster ripple frequency
+  windFreqC: 0.24,          // very slow drift frequency
+
+  rainGrowMult: 3.2,        // <<< growth speed multiplier while it's raining (feel #3)
+  rainSeconds: 5.5,         // how long a rain cloud lingers and rains
+  rainbowSeconds: 6.0,      // how long the after-rain rainbow shows
+
+  fruitRegrow: 4.0,         // seconds for a picked fruit to grow back
+  basketMax: 8,             // items the basket holds before the oldest fades
+
+  maxBees: 5,               // pollinators circulating at once
+  maxWorms: 4,              // worms wandering the soil
+  maxParticles: 250,        // hard particle-pool cap (reused, not allocated)
+
+  volume: 0.5,              // master volume 0..1
+  maxVoices: 10,            // hard cap on concurrent audio voices
+
+  // Palette — used exactly as given, no default web colors substituted.
+  pal: {
+    skyTop: "#8FD3E8", skyLow: "#DCEFF2", sun: "#FFD98A", cloud: "#FFFFFF",
+    hills: "#9DB0A8", wood: "#A9743F", topsoil: "#4A3626", subsoil: "#6B4E36",
+    pebble: "#8C8177", worm: "#E0A0A0", stem: "#5C8F3A", leaf: "#6FA844",
+    leafLight: "#8CC45C", sunflower: "#F2B830", tomatoRipe: "#C33B2C",
+    tomatoGreen: "#7FA64A", carrot: "#E07B29", radish: "#D14A5A",
+    pumpkin: "#E0812B", strawberry: "#D2373F", flowerWhite: "#FDF6E6",
+    bee: "#F0C13A",
+  },
+};
+
+const PAL = CONFIG.pal;
+const SOIL_Y = Math.round(CONFIG.H * CONFIG.soilFrac);
+
+/* -------------------------------------------------------------------------
+   Small math + color helpers
+   ------------------------------------------------------------------------- */
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const TAU = Math.PI * 2;
+const easeOut = t => 1 - Math.pow(1 - t, 3);        // ease-out cubic (surge early, settle)
+const easeInOut = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const easeOutBack = t => { const c = 1.70158, c3 = c + 1; return 1 + c3 * Math.pow(t - 1, 3) + c * Math.pow(t - 1, 2); };
+
+// Deterministic seeded PRNG (mulberry32). Same seed -> same stream, always.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// parse "#rrggbb" once into {r,g,b}
+function hex(h) {
+  const n = parseInt(h.slice(1), 16);
+  return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+const RGB = {}; for (const k in PAL) if (PAL[k][0] === "#") RGB[k] = hex(PAL[k]);
+function mix(c1, c2, t) { // blend two {r,g,b}
+  return { r: lerp(c1.r, c2.r, t), g: lerp(c1.g, c2.g, t), b: lerp(c1.b, c2.b, t) };
+}
+function css(c, a) { // {r,g,b} -> css, optional alpha; darken/brighten via mult in caller
+  return a == null ? `rgb(${c.r | 0},${c.g | 0},${c.b | 0})` : `rgba(${c.r | 0},${c.g | 0},${c.b | 0},${a})`;
+}
+function shade(c, m) { return { r: clamp(c.r * m, 0, 255), g: clamp(c.g * m, 0, 255), b: clamp(c.b * m, 0, 255) }; }
+
+/* =========================================================================
+   PLANT SPECS — per-type parameters in one readable table. To add a ninth
+   plant, add an entry here reusing one of the existing `form` builders; you
+   should not need to touch the generator itself.
+   ========================================================================= */
+const SPECS = {
+  sunflower: {
+    form: "stalk", height: 300, thick: 11, nodes: 6, leafLen: 66, leafW: 34,
+    stemDone: 0.7, bloomStart: 0.72, headR: 46, petals: 24, petalLen: 40,
+    rootLen: 150, rootBranch: 5, note: null,
+    stemCol: "stem", leafCol: "leaf",
+  },
+  carrot: {
+    form: "root", height: 110, thick: 4, fronds: 7, frondLen: 92,
+    stemDone: 0.6, taper: "cone", rootLen: 165, rootW: 30, rootCol: "carrot",
+    stemCol: "stem", leafCol: "leafLight",
+  },
+  radish: {
+    form: "root", height: 70, thick: 4, fronds: 5, frondLen: 58,
+    stemDone: 0.6, taper: "bulb", rootLen: 74, rootW: 46, rootCol: "radish",
+    stemCol: "stem", leafCol: "leaf",
+  },
+  tomato: {
+    form: "bush", height: 200, thick: 8, nodes: 5, leafLen: 46, leafW: 30,
+    stemDone: 0.55, branches: 4, fruitPer: 3, fruitR: 15,
+    rootLen: 120, rootBranch: 5,
+    stemCol: "stem", leafCol: "leaf",
+  },
+  corn: {
+    form: "corn", height: 330, thick: 13, blades: 7, bladeLen: 120,
+    stemDone: 0.72, tasselStart: 0.78, earR: 22,
+    rootLen: 130, rootBranch: 6,
+    stemCol: "leaf", leafCol: "leafLight",
+  },
+  pumpkin: {
+    form: "vineGround", height: 40, thick: 9, len: 300, leaves: 6, leafLen: 60,
+    stemDone: 0.6, fruitStart: 0.62, fruitR: 44,
+    rootLen: 90, rootBranch: 5,
+    stemCol: "stem", leafCol: "leaf",
+  },
+  bean: {
+    form: "vinePole", height: 260, thick: 6, poleH: 250, turns: 3.4, leaves: 8, leafLen: 40,
+    stemDone: 0.8, podStart: 0.7, pods: 4,
+    rootLen: 110, rootBranch: 4,
+    stemCol: "stem", leafCol: "leaf",
+  },
+  strawberry: {
+    form: "rosette", height: 60, thick: 4, leaves: 6, leafLen: 46,
+    stemDone: 0.5, flowerStart: 0.45, berryStart: 0.62, berries: 4, berryR: 13,
+    rootLen: 70, rootBranch: 6,
+    stemCol: "stem", leafCol: "leaf",
+  },
+};
+const SPEC_ORDER = ["sunflower", "carrot", "radish", "tomato", "corn", "pumpkin", "bean", "strawberry"];
+
+// Pentatonic scale (C D E G A) across two octaves — every growth tone snaps
+// to one of these so a toddler mashing the soil makes music, not noise.
+const PENTA = (() => {
+  const semis = [0, 2, 4, 7, 9, 12, 14, 16, 19, 21];
+  return semis.map(s => 261.63 * Math.pow(2, s / 12));
+})();
+
+/* =========================================================================
+   THE PLANT GENERATOR
+
+   buildPlant(type, seed, g) -> geometry, purely determined by its arguments.
+   Coordinates are plant-local: origin (0,0) is the soil-surface base.
+   Up is negative y (above ground); down is positive y (roots, in the
+   cutaway). Every above-ground vertex carries `h` in 0..1 (0 at base, 1 at
+   the highest point) so the wind field can bend the tip more than the base.
+
+   Returned shape:
+     { above:[el...], below:[el...], tip:{x,y}, canopy:{x,y,r},
+       flowers:[{x,y,h}...], picks:[{x,y,h,idx,kind}...], topH }
+   ========================================================================= */
+function buildPlant(type, seed, g) {
+  const spec = SPECS[type];
+  const rng = mulberry32(seed);
+  // per-plant variation, deterministic from the seed
+  const hJit = 0.85 + rng() * 0.30;          // +/-15% height
+  const lean = (rng() - 0.5) * 0.24;          // slight lean, radians of overall tilt
+  const side = rng() < 0.5 ? -1 : 1;          // which way lateral features favor
+  const out = { above: [], below: [], flowers: [], picks: [], tip: { x: 0, y: 0 }, canopy: { x: 0, y: -20, r: 20 }, topH: 1 };
+
+  const cS = RGB[spec.stemCol], cL = RGB[spec.leafCol], cLL = RGB.leafLight;
+
+  // ---- shared: build a leaning stem polyline of `count` visible nodes ----
+  function stemPath(height, thick, count, growFrac, curveAmt) {
+    const pts = [];
+    const shownH = height * easeOut(clamp(g / growFrac, 0, 1));
+    const nShown = Math.max(1, Math.round(count * clamp(g / growFrac, 0, 1) + 0.5));
+    const N = Math.max(2, nShown);
+    for (let i = 0; i <= N; i++) {
+      const f = i / N;                          // 0 base -> 1 tip
+      const y = -shownH * f;
+      // gentle S-curve plus overall lean, both scaled by height fraction
+      const x = Math.sin(f * Math.PI) * curveAmt * side + lean * shownH * f;
+      const w = lerp(thick, thick * 0.35, f);   // taper toward the tip
+      pts.push({ x, y, h: f, w });               // h == height fraction here
+    }
+    return { pts, shownH };
+  }
+
+  // ---- shared: a leaf blade element ----
+  function leaf(base, ang, len, wid, curl, lg, colBase, colTip) {
+    return { t: "leaf", x: base.x, y: base.y, h: base.h, ang, len: len * lg, wid: wid * lg,
+             curl, cb: colBase, ct: colTip };
+  }
+
+  // ---- shared: downward root system via the same branching idea ----
+  function roots(len, branches, growFrac) {
+    const rg = clamp(g / growFrac, 0, 1);
+    const grown = easeOut(rg);
+    function branch(x, y, ang, l, w, depth) {
+      if (l < 8 || depth > 3) return;
+      const steps = 5;
+      const pts = [{ x, y }];
+      let cx = x, cy = y, a = ang;
+      for (let i = 1; i <= steps; i++) {
+        a += (rng() - 0.5) * 0.5;               // meander, deterministic
+        cx += Math.sin(a) * (l / steps);
+        cy += Math.cos(a) * (l / steps);        // cos ~ downward (ang around 0 = straight down)
+        pts.push({ x: cx, y: cy });
+      }
+      out.below.push({ t: "root", pts, w0: w, w1: w * 0.3 });
+      const childN = depth < 2 ? 2 + (rng() * 2 | 0) : 1;
+      for (let c = 0; c < childN; c++) {
+        const t = 0.4 + rng() * 0.5;
+        const bi = Math.min(pts.length - 1, Math.round(t * steps));
+        branch(pts[bi].x, pts[bi].y, ang + (rng() - 0.5) * 1.1, l * (0.45 + rng() * 0.25), w * 0.6, depth + 1);
+      }
+    }
+    // a few primary roots fanning downward
+    const primaries = Math.max(2, Math.round(branches * 0.6));
+    for (let i = 0; i < primaries; i++) {
+      const a = (i / (primaries - 1 || 1) - 0.5) * 1.1;
+      branch(0, 0, a, len * grown * (0.7 + rng() * 0.5), spec.thick * 0.6, 0);
+    }
+  }
+
+  const H0 = spec.height * hJit;
+
+  /* ---------------- FORM: stalk (sunflower, corn-ish base) ------------- */
+  if (spec.form === "stalk") {
+    const st = stemPath(H0, spec.thick, spec.nodes, spec.stemDone, 26);
+    out.above.push({ t: "stem", pts: st.pts, col: cS });
+    out.tip = { x: st.pts[st.pts.length - 1].x, y: st.pts[st.pts.length - 1].y };
+    // leaves stagger up the stem, each with its own unfurl
+    for (let i = 1; i < spec.nodes; i++) {
+      const thr = 0.12 + (i / spec.nodes) * (spec.stemDone - 0.05);
+      const lg = easeOut(clamp((g - thr) / 0.18, 0, 1));
+      if (lg <= 0) continue;
+      const f = i / spec.nodes;
+      const nodeY = -st.shownH * f, nodeX = Math.sin(f * Math.PI) * 26 * side + lean * st.shownH * f;
+      const sd = i % 2 === 0 ? 1 : -1;
+      out.above.push(leaf({ x: nodeX, y: nodeY, h: f },
+        sd * (1.15 + rng() * 0.2), spec.leafLen, spec.leafW, sd * 0.4, lg, cS, cLL));
+    }
+    // terminal head: seeded disc + petals blooming last
+    const bloom = easeOut(clamp((g - spec.bloomStart) / (1 - spec.bloomStart), 0, 1));
+    if (bloom > 0) {
+      const hx = out.tip.x, hy = out.tip.y - spec.headR * 0.4 * bloom, hh = 1;
+      const r = spec.headR * (0.4 + 0.6 * bloom);
+      out.above.push({ t: "sunhead", x: hx, y: hy, h: hh, r, bloom, petals: spec.petals, petalLen: spec.petalLen });
+      out.canopy = { x: hx, y: hy, r: r + spec.petalLen * bloom };
+      out.flowers.push({ x: hx, y: hy, h: hh });
+    } else {
+      out.canopy = { x: out.tip.x, y: out.tip.y, r: 30 };
+    }
+    roots(spec.rootLen, spec.rootBranch, spec.stemDone);
+  }
+
+  /* ---------------- FORM: root crop (carrot, radish) ------------------- */
+  else if (spec.form === "root") {
+    // small ferny/leafy greens above ground
+    const topGrow = easeOut(clamp(g / spec.stemDone, 0, 1));
+    for (let i = 0; i < spec.fronds; i++) {
+      const thr = 0.05 + (i / spec.fronds) * 0.4;
+      const lg = easeOut(clamp((g - thr) / 0.2, 0, 1));
+      if (lg <= 0) continue;
+      const a = (i / (spec.fronds - 1) - 0.5) * 1.5 + lean;
+      const len = spec.frondLen * (0.7 + (i % 2) * 0.3);
+      if (type === "carrot") {
+        out.above.push({ t: "frond", x: 0, y: -2, h: 1, ang: a, len: len * lg, col: cL });
+      } else {
+        out.above.push(leaf({ x: 0, y: -2, h: 1 }, a, len, spec.frondLen * 0.55, a * 0.3, lg, cS, cLL));
+      }
+    }
+    out.tip = { x: 0, y: -spec.frondLen * topGrow };
+    out.canopy = { x: 0, y: -spec.frondLen * 0.5 * topGrow, r: 40 };
+    // the star: the swelling taproot in the cutaway
+    const rg = easeOut(clamp(g / 0.95, 0, 1));
+    const rootCol = RGB[spec.rootCol];
+    out.below.push({ t: "taproot", taper: spec.taper, len: spec.rootLen * rg, w: spec.rootW * rg, col: rootCol });
+    // a few fine hairs off the taproot
+    for (let i = 0; i < 5; i++) {
+      const ty = spec.rootLen * rg * (0.2 + i * 0.15);
+      const l = 18 * rg * (spec.taper === "bulb" ? 0.6 : 1);
+      out.below.push({ t: "root", pts: [{ x: 0, y: ty }, { x: (rng() < 0.5 ? -1 : 1) * l, y: ty + l * 0.7 }], w0: 2.4, w1: 0.6 });
+    }
+  }
+
+  /* ---------------- FORM: bush (tomato) -------------------------------- */
+  else if (spec.form === "bush") {
+    const st = stemPath(H0, spec.thick, spec.nodes, spec.stemDone, 18);
+    out.above.push({ t: "stem", pts: st.pts, col: cS });
+    out.tip = { x: st.pts[st.pts.length - 1].x, y: st.pts[st.pts.length - 1].y };
+    out.canopy = { x: out.tip.x, y: out.tip.y + 30, r: 70 };
+    let pickIdx = 0;
+    for (let i = 0; i < spec.branches; i++) {
+      const thr = 0.18 + (i / spec.branches) * (spec.stemDone - 0.05);
+      const bg = easeOut(clamp((g - thr) / 0.22, 0, 1));
+      if (bg <= 0) continue;
+      const f = 0.35 + 0.6 * (i / spec.branches);
+      const baseY = -st.shownH * f, baseX = Math.sin(f * Math.PI) * 18 * side + lean * st.shownH * f;
+      const sd = i % 2 === 0 ? 1 : -1;
+      const bl = 54 * bg;
+      const ex = baseX + sd * bl * 0.7, ey = baseY - bl * 0.5;
+      out.above.push({ t: "stem", pts: [{ x: baseX, y: baseY, h: f, w: 4 }, { x: ex, y: ey, h: f + 0.08, w: 2 }], col: cS });
+      out.above.push(leaf({ x: ex, y: ey, h: f + 0.08 }, sd * 0.9, spec.leafLen, spec.leafW, sd * 0.3, bg, cS, cL));
+      // a flower that becomes ripening fruit
+      const fg = clamp((g - thr - 0.15) / 0.35, 0, 1);
+      if (fg > 0 && pickIdx < spec.branches) {
+        const ripe = clamp((g - thr - 0.25) / 0.4, 0, 1);
+        if (ripe < 0.15) out.flowers.push({ x: ex, y: ey, h: f + 0.08 });
+        out.picks.push({ x: ex, y: ey, h: f + 0.08, idx: pickIdx, kind: "tomato",
+          r: spec.fruitR, ripe, grow: fg });
+        pickIdx++;
+      }
+    }
+    roots(spec.rootLen, spec.rootBranch, spec.stemDone);
+  }
+
+  /* ---------------- FORM: corn ---------------------------------------- */
+  else if (spec.form === "corn") {
+    const st = stemPath(H0, spec.thick, spec.blades, spec.stemDone, 12);
+    out.above.push({ t: "stem", pts: st.pts, col: cS });
+    out.tip = { x: st.pts[st.pts.length - 1].x, y: st.pts[st.pts.length - 1].y };
+    for (let i = 0; i < spec.blades; i++) {
+      const thr = 0.08 + (i / spec.blades) * (spec.stemDone - 0.05);
+      const lg = easeOut(clamp((g - thr) / 0.2, 0, 1));
+      if (lg <= 0) continue;
+      const f = 0.1 + 0.85 * (i / spec.blades);
+      const ny = -st.shownH * f, nx = Math.sin(f * Math.PI) * 12 * side + lean * st.shownH * f;
+      const sd = i % 2 === 0 ? 1 : -1;
+      out.above.push({ t: "blade", x: nx, y: ny, h: f, ang: sd * 0.5, len: spec.bladeLen * lg, col: cL });
+    }
+    // tassel of fine lines at the very top
+    const tg = easeOut(clamp((g - spec.tasselStart) / (1 - spec.tasselStart), 0, 1));
+    if (tg > 0) out.above.push({ t: "tassel", x: out.tip.x, y: out.tip.y, h: 1, len: 46 * tg });
+    // one ear with husk + silk (a pickable)
+    const eg = clamp((g - 0.6) / 0.35, 0, 1);
+    if (eg > 0) {
+      const f = 0.5, ey = -st.shownH * f, ex = Math.sin(f * Math.PI) * 12 * side + lean * st.shownH * f + side * 12;
+      out.picks.push({ x: ex, y: ey, h: f, idx: 0, kind: "corn", r: spec.earR, ripe: eg, grow: eg });
+    }
+    out.canopy = { x: out.tip.x, y: out.tip.y, r: 40 };
+    roots(spec.rootLen, spec.rootBranch, spec.stemDone);
+  }
+
+  /* ---------------- FORM: ground vine (pumpkin) ------------------------ */
+  else if (spec.form === "vineGround") {
+    const vg = easeOut(clamp(g / spec.stemDone, 0, 1));
+    const L = spec.len * vg;
+    const pts = [];
+    const N = 10;
+    for (let i = 0; i <= N; i++) {
+      const f = i / N;
+      const x = side * L * f;
+      const y = -6 - Math.sin(f * Math.PI * 2) * 6 - f * 4; // creeps along, faint undulation
+      pts.push({ x, y, h: 0.12 + f * 0.1, w: lerp(spec.thick, 3, f) });
+    }
+    out.above.push({ t: "stem", pts, col: cS });
+    out.tip = { x: pts[N].x, y: pts[N].y };
+    for (let i = 1; i < spec.leaves; i++) {
+      const thr = 0.1 + (i / spec.leaves) * 0.4;
+      const lg = easeOut(clamp((g - thr) / 0.2, 0, 1));
+      if (lg <= 0) continue;
+      const f = i / spec.leaves;
+      const bi = Math.round(f * N), b = pts[bi];
+      out.above.push({ t: "lobeleaf", x: b.x, y: b.y, h: b.h, len: spec.leafLen * lg, col: cL, sd: i % 2 ? 1 : -1 });
+      if (i === 1) out.flowers.push({ x: b.x, y: b.y - 10, h: b.h });
+    }
+    // the pumpkin swells near the vine end
+    const fg = easeOut(clamp((g - spec.fruitStart) / (1 - spec.fruitStart), 0, 1));
+    if (fg > 0) {
+      const b = pts[Math.round(0.8 * N)];
+      out.picks.push({ x: b.x, y: -spec.fruitR * fg * 0.7, h: 0.15, idx: 0, kind: "pumpkin", r: spec.fruitR, ripe: fg, grow: fg });
+    }
+    out.canopy = { x: side * L * 0.5, y: -30, r: 80 };
+    roots(spec.rootLen, spec.rootBranch, spec.stemDone);
+  }
+
+  /* ---------------- FORM: pole vine (bean) ----------------------------- */
+  else if (spec.form === "vinePole") {
+    // the wooden pole is drawn as part of the plant so the vine has support
+    out.above.push({ t: "pole", x: 0, y: 0, h: 1, top: -spec.poleH });
+    const vg = easeOut(clamp(g / spec.stemDone, 0, 1));
+    const topY = -spec.poleH * vg;
+    const pts = [];
+    const N = 26;
+    for (let i = 0; i <= N; i++) {
+      const f = i / N;
+      const y = topY * f;
+      const ang = f * spec.turns * TAU;
+      const x = Math.cos(ang) * 9;               // spiral radius around the pole
+      pts.push({ x, y, h: f, w: lerp(spec.thick, 2.5, f) });
+    }
+    out.above.push({ t: "stem", pts, col: cS });
+    out.tip = { x: pts[N].x, y: pts[N].y };
+    for (let i = 1; i < spec.leaves; i++) {
+      const thr = 0.1 + (i / spec.leaves) * (spec.stemDone - 0.1);
+      const lg = easeOut(clamp((g - thr) / 0.18, 0, 1));
+      if (lg <= 0) continue;
+      const bi = Math.round((i / spec.leaves) * N), b = pts[bi];
+      const sd = b.x >= 0 ? 1 : -1;
+      out.above.push(leaf({ x: b.x, y: b.y, h: b.h }, sd * 0.7, spec.leafLen, spec.leafLen * 0.7, sd * 0.3, lg, cS, cL));
+    }
+    // hanging pods (pickables)
+    const pg = clamp((g - spec.podStart) / (1 - spec.podStart), 0, 1);
+    for (let i = 0; i < spec.pods; i++) {
+      const pgi = easeOut(clamp((pg - i * 0.12) / 0.4, 0, 1));
+      if (pgi <= 0) continue;
+      const bi = Math.round((0.4 + 0.5 * (i / spec.pods)) * N), b = pts[bi];
+      out.picks.push({ x: b.x, y: b.y, h: b.h, idx: i, kind: "pod", r: 8, ripe: pgi, grow: pgi });
+    }
+    out.canopy = { x: 0, y: topY * 0.6, r: 40 };
+    if (out.flowers.length === 0) out.flowers.push({ x: 0, y: topY * 0.7, h: 0.7 });
+    roots(spec.rootLen, spec.rootBranch, spec.stemDone);
+  }
+
+  /* ---------------- FORM: rosette (strawberry) ------------------------- */
+  else if (spec.form === "rosette") {
+    for (let i = 0; i < spec.leaves; i++) {
+      const thr = (i / spec.leaves) * 0.4;
+      const lg = easeOut(clamp((g - thr) / 0.2, 0, 1));
+      if (lg <= 0) continue;
+      const a = (i / spec.leaves) * TAU + lean;
+      out.above.push({ t: "trifoliate", x: 0, y: -6, h: 0.6, ang: a, len: spec.leafLen * lg, col: cL });
+    }
+    // white flowers, then red seeded berries
+    const flg = easeOut(clamp((g - spec.flowerStart) / 0.25, 0, 1));
+    const bg = clamp((g - spec.berryStart) / (1 - spec.berryStart), 0, 1);
+    for (let i = 0; i < spec.berries; i++) {
+      const a = (i / spec.berries) * TAU + 0.6 + lean;
+      const rr = 34 * (0.5 + 0.5 * flg);
+      const bx = Math.cos(a) * rr, by = -10 - Math.sin(a) * 12;
+      const bgi = easeOut(clamp((bg - i * 0.1) / 0.4, 0, 1));
+      if (bgi > 0) {
+        out.picks.push({ x: bx, y: by, h: 0.5, idx: i, kind: "berry", r: spec.berryR, ripe: bgi, grow: bgi });
+      } else if (flg > 0.2) {
+        out.flowers.push({ x: bx, y: by, h: 0.5 });
+      }
+    }
+    out.tip = { x: 0, y: -30 };
+    out.canopy = { x: 0, y: -18, r: 46 };
+    roots(spec.rootLen, spec.rootBranch, spec.stemDone);
+  }
+
+  // record how high (for wind normalization) — the tip's height
+  out.topH = 1;
+  return out;
+}
+
+/* =========================================================================
+   AUDIO — all synthesized. Master gain -> gentle lowpass -> destination.
+   Voice-capped so palm-mashing stays musical instead of turning to mush.
+   ========================================================================= */
+const Audio = (() => {
+  let ctx = null, master = null, lp = null, voices = 0, birdTimer = 0, rainBus = null;
+  function ensure() {
+    if (ctx) return true;
+    try {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      master = ctx.createGain(); master.gain.value = CONFIG.volume;
+      lp = ctx.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 4200; lp.Q.value = 0.6;
+      master.connect(lp); lp.connect(ctx.destination);
+      birdTimer = 3 + Math.random() * 6;
+      return true;
+    } catch (e) { return false; }
+  }
+  function unlock() { if (ensure() && ctx.state === "suspended") ctx.resume(); }
+  const now = () => ctx.currentTime;
+  function canVoice() { return voices < CONFIG.maxVoices; }
+  function track(node) { voices++; node.onended = () => { voices = Math.max(0, voices - 1); }; }
+
+  // sustained tone that rises in pitch with a plant's growth and fades out
+  function growVoice(noteFreq) {
+    if (!ctx || !canVoice()) return null;
+    const o = ctx.createOscillator(); o.type = "triangle";
+    const g = ctx.createGain(); g.gain.value = 0.0001;
+    o.connect(g); g.connect(master);
+    const t = now(), dur = CONFIG.growSeconds;
+    o.frequency.setValueAtTime(noteFreq * 0.5, t);
+    o.frequency.exponentialRampToValueAtTime(noteFreq, t + dur);
+    g.gain.linearRampToValueAtTime(0.09, t + 0.25);
+    g.gain.setValueAtTime(0.09, t + dur * 0.5);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.4);
+    o.start(t); o.stop(t + dur + 0.5); track(o);
+    return { o, g };
+  }
+  function stopVoice(v) { if (!v) return; try { const t = now(); v.g.gain.cancelScheduledValues(t); v.g.gain.setValueAtTime(v.g.gain.value, t); v.g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2); v.o.stop(t + 0.25); } catch (e) {} }
+
+  function seedDrop() {
+    if (!ctx || !canVoice()) return;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = "sine"; o.connect(g); g.connect(master);
+    const t = now();
+    o.frequency.setValueAtTime(420, t); o.frequency.exponentialRampToValueAtTime(150, t + 0.12);
+    g.gain.setValueAtTime(0.001, t); g.gain.linearRampToValueAtTime(0.07, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+    o.start(t); o.stop(t + 0.18); track(o);
+  }
+  function pop() {
+    if (!ctx || !canVoice()) return;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = "sine"; o.connect(g); g.connect(master);
+    const t = now();
+    o.frequency.setValueAtTime(320, t); o.frequency.exponentialRampToValueAtTime(880, t + 0.1);
+    g.gain.setValueAtTime(0.001, t); g.gain.linearRampToValueAtTime(0.08, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.16);
+    o.start(t); o.stop(t + 0.18); track(o);
+  }
+  function chirp() {
+    if (!ctx || !canVoice()) return;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = "sine"; o.connect(g); g.connect(master);
+    const t = now(), base = 1800 + Math.random() * 1400;
+    o.frequency.setValueAtTime(base, t);
+    o.frequency.exponentialRampToValueAtTime(base * (1.3 + Math.random() * 0.4), t + 0.08);
+    o.frequency.exponentialRampToValueAtTime(base * 0.8, t + 0.16);
+    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.04, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+    o.start(t); o.stop(t + 0.22); track(o);
+    if (Math.random() < 0.6) setTimeout(chirp, 140 + Math.random() * 120);
+  }
+  // filtered-noise rain bed with layered droplet ticks
+  function startRain() {
+    if (!ctx || rainBus) return;
+    const len = ctx.sampleRate * 2;
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const bp = ctx.createBiquadFilter(); bp.type = "bandpass"; bp.frequency.value = 1400; bp.Q.value = 0.4;
+    const g = ctx.createGain(); g.gain.value = 0.0001;
+    src.connect(bp); bp.connect(g); g.connect(master);
+    src.start(); g.gain.linearRampToValueAtTime(0.06, now() + 0.6);
+    rainBus = { src, g };
+  }
+  function stopRain() {
+    if (!rainBus) return;
+    const t = now(); rainBus.g.gain.linearRampToValueAtTime(0.0001, t + 0.8);
+    const b = rainBus; setTimeout(() => { try { b.src.stop(); } catch (e) {} }, 1000);
+    rainBus = null;
+  }
+  function droplet() {
+    if (!ctx || !canVoice()) return;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = "sine"; o.connect(g); g.connect(master);
+    const t = now(), f = 900 + Math.random() * 900;
+    o.frequency.setValueAtTime(f, t); o.frequency.exponentialRampToValueAtTime(f * 0.6, t + 0.05);
+    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(0.03, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.08);
+    o.start(t); o.stop(t + 0.1); track(o);
+  }
+  // per-bee buzz: two detuned saws through a gain + stereo panner
+  function beeVoice() {
+    if (!ctx || !canVoice()) return null;
+    const o1 = ctx.createOscillator(), o2 = ctx.createOscillator();
+    o1.type = "sawtooth"; o2.type = "sawtooth";
+    o1.frequency.value = 150; o2.frequency.value = 156;
+    const g = ctx.createGain(); g.gain.value = 0.0001;
+    const bp = ctx.createBiquadFilter(); bp.type = "lowpass"; bp.frequency.value = 900;
+    const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+    o1.connect(bp); o2.connect(bp); bp.connect(g);
+    if (pan) { g.connect(pan); pan.connect(master); } else g.connect(master);
+    o1.start(); o2.start(); track(o1);
+    return { o1, o2, g, pan };
+  }
+  function stopBee(v) { if (!v) return; try { const t = now(); v.g.gain.linearRampToValueAtTime(0.0001, t + 0.2); v.o1.stop(t + 0.25); v.o2.stop(t + 0.25); } catch (e) {} }
+
+  function update(dt) {
+    if (!ctx) return;
+    birdTimer -= dt;
+    if (birdTimer <= 0) { chirp(); birdTimer = 8 + Math.random() * 7; }
+  }
+  return { unlock, ensure, growVoice, stopVoice, seedDrop, pop, chirp, startRain, stopRain, droplet, beeVoice, stopBee, update, isOn: () => !!ctx };
+})();
+
+/* =========================================================================
+   ENTITIES + WORLD STATE
+   ========================================================================= */
+const state = {
+  t: 0,                       // world time (seconds)
+  plants: [],
+  fruits: [],                 // tumbling picked fruit heading to the basket
+  bees: [],
+  worms: [],
+  tunnels: [],                // fading worm traces
+  clouds: [],
+  particles: [],
+  basket: [],                 // collected items {kind, ripe, col, x, y, fade}
+  rainT: 0,                   // remaining rain time
+  rainbowT: 0,                // remaining rainbow time
+  wetGround: 0,               // 0..1 soil darkening
+  sunPulse: 0,                // 0..1 sun-tap flash
+  puddles: [],                // {x, r, life}
+  plantCounter: 0,            // rotates through plant types for variety
+  seedCounter: 1234,
+};
+
+// Global wind field: sum of sines -> slow gusts, not uniform sway.
+function windAt(x) {
+  const t = state.t;
+  const s = Math.sin(t * CONFIG.windFreqA + x * 0.002)
+          + 0.5 * Math.sin(t * CONFIG.windFreqB + x * 0.005)
+          + 0.35 * Math.sin(t * CONFIG.windFreqC);
+  return s * CONFIG.windStrength;
+}
+
+/* ---- particle pool (reused, hard-capped) ---- */
+function spawnParticle(p) {
+  if (state.particles.length >= CONFIG.maxParticles) {
+    // recycle the oldest
+    state.particles.shift();
+  }
+  state.particles.push(p);
+}
+
+/* ---- Plant entity ---- */
+function pickPlantType() {
+  // rotate through the list with a little randomness for variety
+  const base = state.plantCounter++ % SPEC_ORDER.length;
+  const jitter = Math.random() < 0.35 ? (1 + (Math.random() * 3 | 0)) : 0;
+  return SPEC_ORDER[(base + jitter) % SPEC_ORDER.length];
+}
+
+function addPlant(x, delay) {
+  if (state.plants.length >= CONFIG.maxPlants) {
+    // retire the oldest gently (it shrinks away; soil smooths over)
+    const old = state.plants.find(p => !p.retiring);
+    if (old) old.retiring = true;
+  }
+  const type = pickPlantType();
+  const seed = (state.seedCounter = (state.seedCounter * 1103515245 + 12345) & 0x7fffffff);
+  const noteIdx = seed % PENTA.length;
+  const p = {
+    type, seed, x: clamp(x, 40, CONFIG.W - 60),
+    g: 0, p: 0, delay: delay || 0, alive: true, retiring: false, retire: 1,
+    geo: null, cached: false,
+    yScale: 1, vScale: 0,          // vertical squash-spring for the tap bounce
+    sunLean: 0, wet: 0,
+    windScale: 0.85 + Math.random() * 0.4,
+    fruitState: {},                // idx -> {scale, target, picking}
+    noteFreq: PENTA[noteIdx],
+    voice: null, sprouted: false,
+  };
+  state.plants.push(p);
+}
+
+function plantWorldPoint(p, local) {
+  // convert a plant-local point (with h) to world coords incl. wind + bounce
+  const wx = windAt(p.x) * p.windScale;
+  const bend = wx * (local.h * local.h) + p.sunLean * (local.h * local.h) * 40;
+  const y = (local.y < 0 ? local.y * p.yScale : local.y);
+  return { x: p.x + local.x + bend, y: SOIL_Y + y };
+}
+
+function updatePlant(p, dt) {
+  if (p.delay > 0) { p.delay -= dt; return; }
+  if (!p.sprouted) {
+    p.sprouted = true;
+    if (Audio.isOn()) p.voice = Audio.growVoice(p.noteFreq);
+    // soil puff + seed bounce feedback
+    for (let i = 0; i < 8; i++) puff(p.x, SOIL_Y - 2, RGB.topsoil, 1);
+  }
+  // growth, sped up sharply while raining
+  const mult = state.rainT > 0 ? CONFIG.rainGrowMult : 1;
+  if (p.p < 1) {
+    p.p = clamp(p.p + dt / CONFIG.growSeconds * mult, 0, 1);
+    p.g = p.p;
+    p.cached = false;
+    if (p.p >= 1 && p.voice) { Audio.stopVoice(p.voice); p.voice = null; }
+  }
+  // vertical bounce spring toward rest 1.0
+  p.vScale += (1 - p.yScale) * 60 * dt;
+  p.vScale *= Math.pow(0.06, dt);
+  p.yScale += p.vScale * dt;
+  // sun-lean eases back to 0
+  p.sunLean += (0 - p.sunLean) * Math.min(1, dt * 2.5);
+  // wetness (rain perk) eases toward rain state
+  const wantWet = state.rainT > 0 ? 1 : 0;
+  p.wet += (wantWet - p.wet) * Math.min(1, dt * 0.8);
+  // fruit regrow tweening
+  for (const k in p.fruitState) {
+    const fs = p.fruitState[k];
+    fs.scale += (fs.target - fs.scale) * Math.min(1, dt / CONFIG.fruitRegrow * 3.0);
+  }
+  // retiring: shrink away
+  if (p.retiring) {
+    p.retire -= dt * 0.6;
+    if (p.retire <= 0) { p.alive = false; if (p.voice) { Audio.stopVoice(p.voice); p.voice = null; } for (let i = 0; i < 6; i++) puff(p.x, SOIL_Y - 2, RGB.topsoil, 1); }
+  }
+  // rebuild geometry while growing; cache once mature (then only wind at draw)
+  if (!p.cached) {
+    p.geo = buildPlant(p.type, p.seed, p.g);
+    if (p.p >= 1 && !p.retiring) p.cached = true;
+  }
+}
+
+/* ---- fruit (picked, tumbling to basket) ---- */
+function pickFrom(p, pk, worldPos) {
+  const fs = p.fruitState[pk.idx] || (p.fruitState[pk.idx] = { scale: 1, target: 1 });
+  if (fs.scale < 0.4) return false;   // already picked / regrowing
+  fs.scale = 0; fs.target = 1;        // will regrow over fruitRegrow seconds
+  const col = fruitColor(pk);
+  // toss it on a lofted arc into the basket — always lands, never lost
+  const bx = BASKET.x + (Math.random() - 0.5) * 40, by = BASKET.y + 16 + Math.random() * 10;
+  const dist = Math.hypot(bx - worldPos.x, by - worldPos.y);
+  state.fruits.push({
+    x0: worldPos.x, y0: worldPos.y, x: worldPos.x, y: worldPos.y,
+    bx, by, arc: 80 + dist * 0.14, age: 0, dur: clamp(dist / 620, 0.65, 1.4),
+    r: pk.r, col, kind: pk.kind, rot: 0, vr: (Math.random() - 0.5) * 10, landed: false, seeds: pk.kind === "berry",
+  });
+  Audio.pop();
+  return true;
+}
+
+function fruitColor(pk) {
+  if (pk.kind === "tomato") return mix(RGB.tomatoGreen, RGB.tomatoRipe, pk.ripe);
+  if (pk.kind === "pumpkin") return RGB.pumpkin;
+  if (pk.kind === "corn") return RGB.sunflower;
+  if (pk.kind === "pod") return shade(RGB.leaf, 0.9);
+  if (pk.kind === "berry") return mix(RGB.leafLight, RGB.strawberry, pk.ripe);
+  return RGB.tomatoRipe;
+}
+
+function updateFruit(f, dt) {
+  if (f.landed) { f.land += dt; return; }
+  f.age += dt; f.rot += f.vr * dt;
+  const u = clamp(f.age / f.dur, 0, 1), e = easeInOut(u);
+  f.x = lerp(f.x0, f.bx, e);
+  f.y = lerp(f.y0, f.by, e) - f.arc * Math.sin(u * Math.PI);   // lofted arc
+  if (u >= 1) { f.landed = true; f.land = 0; addToBasket(f); }
+}
+function addToBasket(f) {
+  state.basket.push({ kind: f.kind, col: f.col, r: f.r, seeds: f.seeds, jx: (Math.random() - 0.5) * 44, jy: (Math.random() * 26), fade: 1 });
+  if (state.basket.length > CONFIG.basketMax) {
+    state.basket[0].fadingOut = true;   // oldest quietly fades
+  }
+}
+
+/* ---- bees / butterflies ---- */
+function addBee(x, y) {
+  if (state.bees.length >= CONFIG.maxBees) return;
+  const butter = Math.random() < 0.35;
+  state.bees.push({
+    x, y, vx: 0, vy: 0, tx: x, ty: y, wpHold: 0, phase: Math.random() * TAU,
+    butter, hue: butter ? 1 : 0, wing: 0,
+    voice: butter ? null : Audio.beeVoice(),
+  });
+}
+function beeTarget() {
+  // aim at a flower of a flowering plant, else wander near the canopy
+  const flowering = state.plants.filter(p => p.geo && p.geo.flowers.length && p.p > 0.4 && !p.retiring);
+  if (flowering.length) {
+    const p = flowering[Math.random() * flowering.length | 0];
+    const fl = p.geo.flowers[Math.random() * p.geo.flowers.length | 0];
+    const w = plantWorldPoint(p, fl);
+    return { x: w.x, y: w.y };
+  }
+  return { x: 120 + Math.random() * (CONFIG.W - 240), y: 120 + Math.random() * (SOIL_Y - 160) };
+}
+function updateBee(b, dt) {
+  b.wpHold -= dt; b.phase += dt * 6; b.wing += dt * 40;
+  if (b.wpHold <= 0) { const t = beeTarget(); b.tx = t.x; b.ty = t.y; b.wpHold = 1.2 + Math.random() * 1.6; }
+  // steer toward target with wander noise
+  const dx = b.tx - b.x, dy = b.ty - b.y;
+  b.vx += (dx * 1.6 + Math.cos(b.phase) * 40) * dt;
+  b.vy += (dy * 1.6 + Math.sin(b.phase * 1.3) * 40) * dt;
+  b.vx *= Math.pow(0.02, dt); b.vy *= Math.pow(0.02, dt);
+  b.x += b.vx * dt; b.y += b.vy * dt;
+  b.x = clamp(b.x, 20, CONFIG.W - 20); b.y = clamp(b.y, 40, SOIL_Y - 10);
+  if (b.voice) {
+    const spd = Math.hypot(b.vx, b.vy);
+    try {
+      b.voice.g.gain.value = clamp(0.006 + spd * 0.00012, 0, 0.05);
+      if (b.voice.pan) b.voice.pan.pan.value = clamp((b.x / CONFIG.W) * 2 - 1, -1, 1);
+      b.voice.o1.frequency.value = 145 + spd * 0.1;
+      b.voice.o2.frequency.value = 151 + spd * 0.1;
+    } catch (e) {}
+  }
+}
+
+/* ---- worms ---- */
+function addWorm(surface, x) {
+  if (state.worms.length >= CONFIG.maxWorms && !surface) return null;
+  const w = {
+    x: x != null ? x : 60 + Math.random() * (CONFIG.W - 120),
+    y: surface ? SOIL_Y + 20 : SOIL_Y + 40 + Math.random() * (CONFIG.H - SOIL_Y - 70),
+    ang: Math.random() * TAU, seg: [], surfacing: surface ? 1 : 0, life: 0, wr: 0.6 + Math.random() * 0.6,
+  };
+  for (let i = 0; i < 8; i++) w.seg.push({ x: w.x, y: w.y });
+  state.worms.push(w);
+  return w;
+}
+function updateWorm(w, dt) {
+  w.life += dt;
+  w.ang += (Math.random() - 0.5) * 2 * dt;
+  let tx = Math.cos(w.ang), ty = Math.sin(w.ang) * 0.5 + 0.2;
+  if (w.surfacing > 0) {
+    // rise briefly near the surface, wriggle, then burrow back down
+    w.surfacing -= dt * 0.5;
+    const targetY = SOIL_Y + 12;
+    ty = (targetY - w.y) * 0.02;
+    tx = Math.sin(w.life * 8) * 0.8;
+    if (w.surfacing <= 0) w.diving = true;
+  }
+  if (w.diving) ty = 0.8;
+  const spd = 26 * w.wr;
+  w.x += tx * spd * dt; w.y += ty * spd * dt;
+  // keep inside the soil cutaway
+  w.y = clamp(w.y, SOIL_Y + 6, CONFIG.H - 14);
+  w.x = clamp(w.x, 30, CONFIG.W - 30);
+  // trailing body segments
+  let px = w.x, py = w.y;
+  for (const s of w.seg) { s.x += (px - s.x) * Math.min(1, dt * 12); s.y += (py - s.y) * Math.min(1, dt * 12); px = s.x; py = s.y; }
+  // faint fading tunnel trace
+  if (Math.random() < 0.3 && w.y > SOIL_Y + 10) state.tunnels.push({ x: w.x, y: w.y, life: 1 });
+  if (w.diving && w.y > CONFIG.H - 20) w.dead = true;
+}
+
+/* ---- clouds + rain ---- */
+function addCloud(x, y, rainy) {
+  state.clouds.push({ x, y, w: 120 + Math.random() * 80, spd: 6 + Math.random() * 8, rainy: !!rainy, puff: Math.random() * TAU });
+}
+function startRain(x) {
+  state.rainT = CONFIG.rainSeconds;
+  addCloud(clamp(x, 200, CONFIG.W - 200), 120 + Math.random() * 40, true);
+  Audio.startRain();
+}
+
+/* ---- puffs / small particles ---- */
+function puff(x, y, col, scale) {
+  spawnParticle({ kind: "puff", x, y, vx: (Math.random() - 0.5) * 40, vy: -20 - Math.random() * 30,
+    r: (6 + Math.random() * 8) * (scale || 1), life: 1, col });
+}
+function steam(x, y) {
+  spawnParticle({ kind: "steam", x, y, vx: (Math.random() - 0.5) * 8, vy: -18 - Math.random() * 10, r: 6 + Math.random() * 6, life: 1 });
+}
+function petal(x, y, col) {
+  spawnParticle({ kind: "petal", x, y, vx: (Math.random() - 0.5) * 90, vy: -30 - Math.random() * 30, r: 8, life: 1, col, rot: Math.random() * TAU, vr: (Math.random() - 0.5) * 8 });
+}
+function raindrop() {
+  spawnParticle({ kind: "rain", x: Math.random() * CONFIG.W, y: -10, vx: -30, vy: 520 + Math.random() * 120, len: 14 + Math.random() * 8, life: 1 });
+}
+
+function updateParticle(pt, dt) {
+  if (pt.kind === "puff") { pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vy += 30 * dt; pt.life -= dt * 1.6; pt.r += dt * 10; }
+  else if (pt.kind === "steam") { pt.x += pt.vx * dt + Math.sin(state.t * 2 + pt.y) * 4 * dt; pt.y += pt.vy * dt; pt.life -= dt * 0.6; pt.r += dt * 8; }
+  else if (pt.kind === "petal") { pt.vy += 120 * dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.rot += pt.vr * dt; pt.vx *= Math.pow(0.3, dt); pt.life -= dt * 0.7; }
+  else if (pt.kind === "rain") {
+    pt.x += pt.vx * dt; pt.y += pt.vy * dt;
+    if (pt.y > SOIL_Y - 2) {
+      pt.life = 0;
+      // splash + a puddle now and then
+      if (Math.random() < 0.25) state.puddles.push({ x: pt.x, r: 2, life: 1 });
+    }
+  }
+  if (pt.life <= 0) pt.dead = true;
+}
+
+/* =========================================================================
+   DRAWING
+   ========================================================================= */
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+let VW = window.innerWidth, VH = window.innerHeight, scale = 1, offX = 0, offY = 0, dpr = 1;
+
+function resize() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  VW = window.innerWidth; VH = window.innerHeight;
+  canvas.width = Math.floor(VW * dpr); canvas.height = Math.floor(VH * dpr);
+  canvas.style.width = VW + "px"; canvas.style.height = VH + "px";
+  // letterbox the fixed 1280x720 logical stage
+  scale = Math.min(VW / CONFIG.W, VH / CONFIG.H);
+  offX = (VW - CONFIG.W * scale) / 2;
+  offY = (VH - CONFIG.H * scale) / 2;
+}
+window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", resize);
+resize();
+
+function screenToLogical(sx, sy) {
+  return { x: (sx - offX) / scale, y: (sy - offY) / scale };
+}
+
+// --- draw a tapered stem/branch/root as a filled ribbon polygon ---
+function ribbon(pts, colTop, colBot) {
+  if (pts.length < 2) return;
+  ctx.beginPath();
+  // forward along the left offset
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[Math.min(i + 1, pts.length - 1)];
+    let nx = -(b.y - a.y), ny = (b.x - a.x); const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+    const w = (a.w != null ? a.w : 4) * 0.5;
+    const X = a.x + nx * w, Y = a.y + ny * w;
+    if (i === 0) ctx.moveTo(X, Y); else ctx.lineTo(X, Y);
+  }
+  // back along the right offset
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const a = pts[i], b = pts[Math.min(i + 1, pts.length - 1)];
+    let nx = -(b.y - a.y), ny = (b.x - a.x); const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+    const w = (a.w != null ? a.w : 4) * 0.5;
+    ctx.lineTo(a.x - nx * w, a.y - ny * w);
+  }
+  ctx.closePath();
+  if (colBot) {
+    const g = ctx.createLinearGradient(pts[0].x, pts[0].y, pts[pts.length - 1].x, pts[pts.length - 1].y);
+    g.addColorStop(0, colBot); g.addColorStop(1, colTop); ctx.fillStyle = g;
+  } else ctx.fillStyle = colTop;
+  ctx.fill();
+}
+
+// --- a single leaf blade ---
+function drawLeaf(bx, by, ang, len, wid, curl, cb, ct) {
+  const tipx = bx + Math.cos(ang - Math.PI / 2) * len + Math.cos(ang) * curl * 30;
+  const tipy = by + Math.sin(ang - Math.PI / 2) * len + Math.sin(ang) * curl * 30;
+  const mx = (bx + tipx) / 2, my = (by + tipy) / 2;
+  const px = Math.cos(ang) * wid * 0.5, py = Math.sin(ang) * wid * 0.5;
+  ctx.beginPath();
+  ctx.moveTo(bx, by);
+  ctx.quadraticCurveTo(mx + px, my + py, tipx, tipy);
+  ctx.quadraticCurveTo(mx - px, my - py, bx, by);
+  ctx.closePath();
+  const g = ctx.createLinearGradient(bx, by, tipx, tipy);
+  g.addColorStop(0, css(cb)); g.addColorStop(1, css(ct));
+  ctx.fillStyle = g; ctx.fill();
+  // midrib
+  ctx.strokeStyle = css(shade(cb, 0.85), 0.5); ctx.lineWidth = 1.4;
+  ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(tipx, tipy); ctx.stroke();
+}
+
+// --- above-ground plant geometry ---
+function drawPlantAbove(p) {
+  const geo = p.geo; if (!geo) return;
+  const wx = windAt(p.x) * p.windScale;
+  const flutter = wx * 0.02 + 0.05;
+  const shrink = p.retiring ? easeOut(clamp(p.retire, 0, 1)) : 1;
+  ctx.save();
+  ctx.translate(p.x, SOIL_Y);
+  ctx.scale(shrink, shrink);
+  const wetShade = 1 - p.wet * 0.12;   // rain deepens color a touch
+
+  for (const el of geo.above) {
+    if (el.t === "stem") {
+      const pts = el.pts.map(q => ({
+        x: q.x + wx * (q.h * q.h) + p.sunLean * (q.h * q.h) * 40,
+        y: (q.y < 0 ? q.y * p.yScale : q.y), w: q.w,
+      }));
+      ribbon(pts, css(shade(el.col, wetShade)), css(shade(el.col, 0.7 * wetShade)));
+    }
+    else if (el.t === "pole") {
+      // wooden bean pole + a couple of ties
+      ctx.fillStyle = css(shade(RGB.wood, 0.95));
+      ctx.fillRect(-4, el.top * p.yScale, 8, -el.top * p.yScale);
+      ctx.fillStyle = css(shade(RGB.wood, 0.7));
+      ctx.fillRect(2, el.top * p.yScale, 2, -el.top * p.yScale);
+    }
+    else if (el.t === "leaf") {
+      const bx = el.x + wx * (el.h * el.h), by = el.y * p.yScale;
+      drawLeaf(bx, by, el.ang + flutter, el.len, el.wid, el.curl, shade(el.cb, wetShade), shade(el.ct, wetShade));
+    }
+    else if (el.t === "frond") {
+      // feathery carrot top: a central rib with many fine side-hairs
+      const bx = el.x + wx * (el.h * el.h), by = el.y * p.yScale;
+      const ex = bx + Math.cos(el.ang - Math.PI / 2) * el.len;
+      const ey = by + Math.sin(el.ang - Math.PI / 2) * el.len;
+      ctx.strokeStyle = css(shade(el.col, wetShade)); ctx.lineWidth = 2; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(ex, ey); ctx.stroke();
+      ctx.lineWidth = 1.2;
+      for (let s = 1; s <= 6; s++) {
+        const t = s / 7, hx = lerp(bx, ex, t), hy = lerp(by, ey, t), hl = el.len * 0.16;
+        for (const sd of [-1, 1]) {
+          ctx.beginPath(); ctx.moveTo(hx, hy);
+          ctx.lineTo(hx + Math.cos(el.ang + sd * 1.2) * hl, hy + Math.sin(el.ang + sd * 1.2) * hl);
+          ctx.stroke();
+        }
+      }
+    }
+    else if (el.t === "blade") {
+      // long drooping corn blade
+      const bx = el.x + wx * (el.h * el.h), by = el.y * p.yScale;
+      drawLeaf(bx, by, el.ang + flutter, el.len, 16, el.ang * 0.4 + 0.4, shade(el.col, wetShade), shade(RGB.leafLight, wetShade));
+    }
+    else if (el.t === "tassel") {
+      const bx = el.x + wx, by = el.y * p.yScale;
+      ctx.strokeStyle = css(shade(RGB.sunflower, 0.9)); ctx.lineWidth = 1.4; ctx.lineCap = "round";
+      for (let i = 0; i < 7; i++) {
+        const a = -Math.PI / 2 + (i / 6 - 0.5) * 1.1;
+        ctx.beginPath(); ctx.moveTo(bx, by);
+        ctx.quadraticCurveTo(bx + Math.cos(a) * el.len * 0.5, by + Math.sin(a) * el.len,
+          bx + Math.cos(a) * el.len, by + Math.sin(a) * el.len * 0.8); ctx.stroke();
+      }
+    }
+    else if (el.t === "lobeleaf") {
+      const bx = el.x + wx * (el.h * el.h), by = el.y * p.yScale - 6;
+      drawLobeLeaf(bx, by, el.len, el.sd, shade(RGB.leaf, wetShade));
+    }
+    else if (el.t === "trifoliate") {
+      const bx = el.x + wx * 0.3, by = el.y * p.yScale;
+      const ex = bx + Math.cos(el.ang) * el.len, ey = by + Math.sin(el.ang) * el.len * 0.6;
+      ctx.strokeStyle = css(shade(RGB.stem, wetShade)); ctx.lineWidth = 2.4; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(ex, ey); ctx.stroke();
+      for (const sd of [-0.5, 0, 0.5]) drawLeaf(ex, ey, el.ang + sd, el.len * 0.5, el.len * 0.4, 0, shade(RGB.leaf, wetShade), shade(RGB.leafLight, wetShade));
+    }
+    else if (el.t === "sunhead") {
+      drawSunHead(el.x + wx, el.y * p.yScale, el.r, el.bloom, el.petals, el.petalLen, p.wet);
+    }
+  }
+
+  // flowers (small blossoms) that are not full sunflower heads
+  for (const fl of geo.flowers) {
+    if (p.type === "sunflower" || p.type === "bean") continue;
+    const bx = fl.x + wx * (fl.h * fl.h), by = fl.y * p.yScale;
+    drawBlossom(bx, by, p.type);
+  }
+
+  // pickables (fruit / berries / pods / ears / pumpkins), scaled by regrow state
+  for (const pk of geo.picks) {
+    const fs = p.fruitState[pk.idx] || (p.fruitState[pk.idx] = { scale: 1, target: 1 });
+    const sc = fs.scale * pk.grow;
+    if (sc <= 0.02) continue;
+    const bx = pk.x + wx * (pk.h * pk.h), by = pk.y * p.yScale;
+    drawPickable(bx, by, pk, sc, p.wet);
+  }
+
+  ctx.restore();
+}
+
+// pumpkin-style big lobed leaf
+function drawLobeLeaf(x, y, len, sd, col) {
+  ctx.save(); ctx.translate(x, y);
+  ctx.beginPath();
+  const R = len * 0.6;
+  for (let i = 0; i <= 10; i++) {
+    const a = -Math.PI / 2 + (i / 10 - 0.5) * 2.2;
+    const lobe = 1 + 0.18 * Math.cos(i * 1.7);
+    const px = Math.cos(a) * R * lobe, py = Math.sin(a) * R * lobe * 0.8;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = css(col); ctx.fill();
+  ctx.strokeStyle = css(shade(col, 0.8), 0.6); ctx.lineWidth = 1.2;
+  for (let i = 0; i < 5; i++) { const a = -Math.PI / 2 + (i / 4 - 0.5) * 1.8; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(Math.cos(a) * R * 0.9, Math.sin(a) * R * 0.7); ctx.stroke(); }
+  ctx.restore();
+}
+
+// sunflower head: seeded disc (phyllotaxis dots) + ring of blooming petals
+function drawSunHead(x, y, r, bloom, petalN, petalLen, wet) {
+  ctx.save(); ctx.translate(x, y);
+  const pl = petalLen * bloom;
+  ctx.fillStyle = css(shade(RGB.sunflower, 1 - wet * 0.1));
+  for (let i = 0; i < petalN; i++) {
+    const a = (i / petalN) * TAU;
+    const open = easeOutBack(clamp(bloom, 0, 1));
+    ctx.save(); ctx.rotate(a);
+    ctx.beginPath();
+    ctx.moveTo(r * 0.8, 0);
+    ctx.quadraticCurveTo(r + pl * 0.5, -8 * open, r + pl, 0);
+    ctx.quadraticCurveTo(r + pl * 0.5, 8 * open, r * 0.8, 0);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  // disc
+  const g = ctx.createRadialGradient(0, 0, 2, 0, 0, r);
+  g.addColorStop(0, css(shade(RGB.topsoil, 1.6))); g.addColorStop(1, css(shade(RGB.topsoil, 1.1)));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill();
+  // seed dots via golden-angle spiral
+  ctx.fillStyle = css(shade(RGB.topsoil, 0.7));
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  const n = Math.floor(90 * bloom);
+  for (let i = 0; i < n; i++) {
+    const rr = r * 0.92 * Math.sqrt(i / 90), a = i * golden;
+    ctx.beginPath(); ctx.arc(Math.cos(a) * rr, Math.sin(a) * rr, 1.6, 0, TAU); ctx.fill();
+  }
+  ctx.restore();
+}
+
+// small blossoms per plant type (tomato yellow, strawberry white, pumpkin orange)
+function drawBlossom(x, y, type) {
+  let col = RGB.sunflower, pet = 5, r = 6;
+  if (type === "strawberry") { col = RGB.flowerWhite; pet = 5; r = 6; }
+  else if (type === "pumpkin") { col = RGB.pumpkin; pet = 5; r = 9; }
+  else if (type === "tomato") { col = RGB.sunflower; pet = 5; r = 5; }
+  ctx.save(); ctx.translate(x, y);
+  ctx.fillStyle = css(col);
+  for (let i = 0; i < pet; i++) { const a = (i / pet) * TAU; ctx.beginPath(); ctx.ellipse(Math.cos(a) * r, Math.sin(a) * r, r * 0.7, r * 0.5, a, 0, TAU); ctx.fill(); }
+  ctx.fillStyle = css(shade(RGB.sunflower, 0.8)); ctx.beginPath(); ctx.arc(0, 0, r * 0.5, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+
+// pickable fruit rendering, ripening color baked in
+function drawPickable(x, y, pk, sc, wet) {
+  ctx.save(); ctx.translate(x, y);
+  const col = fruitColor(pk);
+  if (pk.kind === "tomato" || pk.kind === "berry") {
+    const r = pk.r * sc;
+    ctx.fillStyle = css(shade(col, 1 - wet * 0.08));
+    if (pk.kind === "berry") {
+      // strawberry: heart-ish drop with seed dots
+      ctx.beginPath(); ctx.moveTo(0, r); ctx.bezierCurveTo(-r * 1.3, r * 0.2, -r * 0.8, -r, 0, -r * 0.5);
+      ctx.bezierCurveTo(r * 0.8, -r, r * 1.3, r * 0.2, 0, r); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = css(RGB.sunflower);
+      for (let i = 0; i < 6; i++) { const a = i * 1.1; ctx.beginPath(); ctx.arc(Math.cos(a) * r * 0.5, Math.sin(a) * r * 0.4 - r * 0.1, 0.9, 0, TAU); ctx.fill(); }
+      // little green calyx
+      ctx.fillStyle = css(RGB.leaf);
+      for (const sd of [-1, 0, 1]) { ctx.beginPath(); ctx.moveTo(0, -r * 0.5); ctx.lineTo(sd * r * 0.4, -r * 0.9); ctx.lineTo(sd * r * 0.15, -r * 0.4); ctx.closePath(); ctx.fill(); }
+    } else {
+      ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill();
+      ctx.fillStyle = css(RGB.leaf); for (const sd of [-1, 0, 1]) { ctx.beginPath(); ctx.moveTo(0, -r); ctx.lineTo(sd * r * 0.4, -r * 1.4); ctx.lineTo(sd * r * 0.1, -r * 0.8); ctx.closePath(); ctx.fill(); }
+      ctx.fillStyle = "rgba(255,255,255,0.28)"; ctx.beginPath(); ctx.arc(-r * 0.3, -r * 0.3, r * 0.28, 0, TAU); ctx.fill();
+    }
+  } else if (pk.kind === "pumpkin") {
+    const r = pk.r * sc;
+    ctx.fillStyle = css(RGB.pumpkin);
+    for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.ellipse(i * r * 0.22, 0, r * 0.42, r * 0.9, 0, 0, TAU); ctx.fill(); }
+    ctx.fillStyle = css(shade(RGB.pumpkin, 0.8));
+    ctx.beginPath(); ctx.ellipse(0, 0, r, r * 0.9, 0, 0, TAU); ctx.fill();
+    for (let i = -2; i <= 2; i++) { ctx.strokeStyle = css(shade(RGB.pumpkin, 0.7), 0.6); ctx.lineWidth = 1.4; ctx.beginPath(); ctx.ellipse(0, 0, r * (0.3 + Math.abs(i) * 0.24), r * 0.9, 0, -Math.PI / 2, Math.PI / 2, i < 0); ctx.stroke(); }
+    ctx.fillStyle = css(RGB.stem); ctx.fillRect(-3, -r * 0.95, 6, -8);
+  } else if (pk.kind === "corn") {
+    const r = pk.r * sc;
+    // husk + kernels
+    ctx.fillStyle = css(RGB.leaf); ctx.beginPath(); ctx.ellipse(0, 0, r * 0.8, r * 1.6, 0.2, 0, TAU); ctx.fill();
+    ctx.fillStyle = css(RGB.sunflower);
+    ctx.beginPath(); ctx.ellipse(2, -2, r * 0.55, r * 1.2, 0.2, 0, TAU); ctx.fill();
+    ctx.strokeStyle = css(shade(RGB.sunflower, 0.8), 0.5); ctx.lineWidth = 1;
+    for (let i = -3; i <= 3; i++) { ctx.beginPath(); ctx.moveTo(-r * 0.5, i * r * 0.28); ctx.lineTo(r * 0.5, i * r * 0.28); ctx.stroke(); }
+  } else if (pk.kind === "pod") {
+    const r = pk.r * sc;
+    ctx.strokeStyle = css(shade(RGB.leaf, 0.9)); ctx.lineWidth = r; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.quadraticCurveTo(r * 0.6, r * 1.6, 0, r * 3.2); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// --- below-ground root geometry (drawn in the cutaway) ---
+function drawPlantBelow(p) {
+  const geo = p.geo; if (!geo) return;
+  const shrink = p.retiring ? easeOut(clamp(p.retire, 0, 1)) : 1;
+  ctx.save(); ctx.translate(p.x, SOIL_Y); ctx.scale(shrink, shrink);
+  for (const el of geo.below) {
+    if (el.t === "root") {
+      ctx.strokeStyle = css(shade(RGB.topsoil, 1.7), 0.8);
+      ctx.lineWidth = el.w0; ctx.lineCap = "round"; ctx.lineJoin = "round";
+      ctx.beginPath(); ctx.moveTo(el.pts[0].x, el.pts[0].y);
+      for (let i = 1; i < el.pts.length; i++) ctx.lineTo(el.pts[i].x, el.pts[i].y);
+      ctx.stroke();
+    } else if (el.t === "taproot") {
+      drawTaproot(el);
+    }
+  }
+  ctx.restore();
+}
+function drawTaproot(el) {
+  ctx.save();
+  const col = el.col;
+  if (el.taper === "bulb") {
+    // radish: round bulb sitting just under the surface, thin tail
+    ctx.fillStyle = css(col);
+    ctx.beginPath(); ctx.ellipse(0, el.w * 0.5, el.w * 0.55, el.w * 0.6, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = css(shade(col, 0.85), 0.9); ctx.lineWidth = 3; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(0, el.w * 1.0); ctx.quadraticCurveTo(4, el.len * 0.7, 0, el.len); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.22)"; ctx.beginPath(); ctx.ellipse(-el.w * 0.2, el.w * 0.3, el.w * 0.2, el.w * 0.24, 0, 0, TAU); ctx.fill();
+  } else {
+    // carrot: tapering cone
+    ctx.beginPath();
+    ctx.moveTo(-el.w * 0.5, 0);
+    ctx.quadraticCurveTo(-el.w * 0.55, el.len * 0.5, 0, el.len);
+    ctx.quadraticCurveTo(el.w * 0.55, el.len * 0.5, el.w * 0.5, 0);
+    ctx.closePath();
+    const g = ctx.createLinearGradient(0, 0, 0, el.len);
+    g.addColorStop(0, css(shade(col, 1.1))); g.addColorStop(1, css(shade(col, 0.8)));
+    ctx.fillStyle = g; ctx.fill();
+    // horizontal ridges
+    ctx.strokeStyle = css(shade(col, 0.75), 0.5); ctx.lineWidth = 1;
+    for (let i = 1; i < 6; i++) { const y = el.len * i / 6, w = el.w * 0.5 * (1 - i / 6); ctx.beginPath(); ctx.moveTo(-w, y); ctx.lineTo(w, y); ctx.stroke(); }
+  }
+  ctx.restore();
+}
+
+/* ---- scene layers ---- */
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, SOIL_Y);
+  g.addColorStop(0, PAL.skyTop); g.addColorStop(1, PAL.skyLow);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, CONFIG.W, SOIL_Y);
+}
+const SUN = { x: 1060, y: 120, r: 66 };
+function drawSun() {
+  const pulse = state.sunPulse;
+  ctx.save();
+  const r = SUN.r * (1 + pulse * 0.12);
+  // glow
+  const g = ctx.createRadialGradient(SUN.x, SUN.y, r * 0.4, SUN.x, SUN.y, r * 2.4);
+  g.addColorStop(0, css(RGB.sun, 0.55 + pulse * 0.3)); g.addColorStop(1, css(RGB.sun, 0));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(SUN.x, SUN.y, r * 2.4, 0, TAU); ctx.fill();
+  // rays
+  ctx.strokeStyle = css(RGB.sun, 0.6); ctx.lineWidth = 4; ctx.lineCap = "round";
+  for (let i = 0; i < 12; i++) { const a = i / 12 * TAU + state.t * 0.05; const r0 = r * 1.15, r1 = r * (1.4 + Math.sin(state.t * 2 + i) * 0.08 + pulse * 0.2); ctx.beginPath(); ctx.moveTo(SUN.x + Math.cos(a) * r0, SUN.y + Math.sin(a) * r0); ctx.lineTo(SUN.x + Math.cos(a) * r1, SUN.y + Math.sin(a) * r1); ctx.stroke(); }
+  ctx.fillStyle = css(shade(RGB.sun, 1 + pulse * 0.05)); ctx.beginPath(); ctx.arc(SUN.x, SUN.y, r, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+function drawHills() {
+  ctx.save();
+  const base = SOIL_Y;
+  const layers = [{ c: shade(RGB.hills, 0.85), h: 150, w: 0.9 }, { c: RGB.hills, h: 110, w: 1.3 }, { c: shade(RGB.hills, 1.12), h: 80, w: 1.7 }];
+  for (const L of layers) {
+    ctx.fillStyle = css(L.c);
+    ctx.beginPath(); ctx.moveTo(0, base);
+    for (let x = 0; x <= CONFIG.W; x += 40) {
+      const y = base - L.h - Math.sin(x * 0.004 * L.w + L.h) * 30 - Math.sin(x * 0.011 * L.w) * 16;
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(CONFIG.W, base); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+function drawClouds() {
+  for (const c of state.clouds) {
+    ctx.save();
+    ctx.fillStyle = css(RGB.cloud, 0.85);
+    const puffs = [[0, 0, 1], [-c.w * 0.4, 8, 0.7], [c.w * 0.4, 8, 0.7], [-c.w * 0.18, -10, 0.85], [c.w * 0.2, -8, 0.85]];
+    for (const [dx, dy, s] of puffs) { ctx.beginPath(); ctx.ellipse(c.x + dx, c.y + dy, c.w * 0.4 * s, c.w * 0.28 * s, 0, 0, TAU); ctx.fill(); }
+    if (c.rainy) { ctx.fillStyle = "rgba(120,140,150,0.5)"; for (const [dx, dy, s] of puffs) { ctx.beginPath(); ctx.ellipse(c.x + dx, c.y + dy + 10, c.w * 0.4 * s, c.w * 0.22 * s, 0, 0, TAU); ctx.fill(); } }
+    ctx.restore();
+  }
+}
+function drawSoil() {
+  // layered cutaway: topsoil, subsoil, and a darker deep band
+  const H = CONFIG.H;
+  ctx.fillStyle = css(shade(RGB.topsoil, 1 - state.wetGround * 0.25));
+  ctx.fillRect(0, SOIL_Y, CONFIG.W, 70);
+  const gg = ctx.createLinearGradient(0, SOIL_Y + 60, 0, H);
+  gg.addColorStop(0, css(shade(RGB.subsoil, 1 - state.wetGround * 0.2)));
+  gg.addColorStop(1, css(shade(RGB.topsoil, 0.85)));
+  ctx.fillStyle = gg; ctx.fillRect(0, SOIL_Y + 60, CONFIG.W, H - SOIL_Y - 60);
+  // wavy boundary between topsoil and subsoil
+  ctx.strokeStyle = css(shade(RGB.subsoil, 1.15), 0.5); ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let x = 0; x <= CONFIG.W; x += 24) { const y = SOIL_Y + 66 + Math.sin(x * 0.02) * 6; if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); }
+  ctx.stroke();
+  // scattered pebbles (deterministic-ish per position)
+  ctx.fillStyle = css(RGB.pebble);
+  for (let i = 0; i < 40; i++) {
+    const r = mulberry32(i * 2654435761 >>> 0);
+    const x = r() * CONFIG.W, y = SOIL_Y + 90 + r() * (H - SOIL_Y - 110), rr = 3 + r() * 6;
+    ctx.beginPath(); ctx.ellipse(x, y, rr, rr * 0.7, 0, 0, TAU); ctx.fill();
+  }
+}
+function drawTunnels() {
+  for (const t of state.tunnels) { ctx.fillStyle = css(shade(RGB.topsoil, 0.7), t.life * 0.4); ctx.beginPath(); ctx.arc(t.x, t.y, 4, 0, TAU); ctx.fill(); }
+}
+function drawWorm(w) {
+  ctx.strokeStyle = css(RGB.worm); ctx.lineWidth = 8; ctx.lineCap = "round"; ctx.lineJoin = "round";
+  ctx.beginPath(); ctx.moveTo(w.x, w.y);
+  for (const s of w.seg) ctx.lineTo(s.x, s.y);
+  ctx.stroke();
+  ctx.strokeStyle = css(shade(RGB.worm, 0.85), 0.6); ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(w.x, w.y); for (const s of w.seg) ctx.lineTo(s.x, s.y); ctx.stroke();
+}
+const COMPOST = { x: 130, y: SOIL_Y - 4 };
+function drawCompost() {
+  ctx.save(); ctx.translate(COMPOST.x, COMPOST.y);
+  // a mounded heap of dark earthy bits
+  ctx.fillStyle = css(shade(RGB.topsoil, 0.9));
+  ctx.beginPath(); ctx.moveTo(-70, 0); ctx.quadraticCurveTo(-40, -54, 0, -50); ctx.quadraticCurveTo(46, -56, 70, 0); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = css(shade(RGB.subsoil, 1.05));
+  const chunks = [[-40, -20, 8], [-10, -34, 7], [20, -24, 9], [40, -12, 6], [0, -14, 7], [-24, -6, 6], [30, -34, 6]];
+  for (const [x, y, r] of chunks) { ctx.beginPath(); ctx.ellipse(x, y, r, r * 0.7, 0, 0, TAU); ctx.fill(); }
+  // a few flecks of green/orange peel
+  ctx.fillStyle = css(RGB.leaf); ctx.beginPath(); ctx.ellipse(-18, -30, 6, 3, 0.4, 0, TAU); ctx.fill();
+  ctx.fillStyle = css(RGB.carrot); ctx.beginPath(); ctx.ellipse(24, -30, 5, 2.5, -0.5, 0, TAU); ctx.fill();
+  ctx.restore();
+}
+function drawBedFrame() {
+  // wooden cross-section frame around the soil cutaway (glass-front look)
+  const woodG = ctx.createLinearGradient(0, 0, 0, 20);
+  woodG.addColorStop(0, css(shade(RGB.wood, 1.15))); woodG.addColorStop(1, css(shade(RGB.wood, 0.85)));
+  // top front lip along the soil surface
+  ctx.fillStyle = woodG; ctx.fillRect(0, SOIL_Y - 6, CONFIG.W, 16);
+  ctx.fillStyle = css(shade(RGB.wood, 0.7)); ctx.fillRect(0, SOIL_Y + 8, CONFIG.W, 4);
+  // side posts
+  ctx.fillStyle = css(shade(RGB.wood, 0.95)); ctx.fillRect(0, SOIL_Y - 6, 22, CONFIG.H - SOIL_Y + 6);
+  ctx.fillRect(CONFIG.W - 22, SOIL_Y - 6, 22, CONFIG.H - SOIL_Y + 6);
+  // wood grain hints
+  ctx.strokeStyle = css(shade(RGB.wood, 0.75), 0.4); ctx.lineWidth = 1;
+  for (let x = 40; x < CONFIG.W; x += 90) { ctx.beginPath(); ctx.moveTo(x, SOIL_Y - 4); ctx.lineTo(x + 30, SOIL_Y + 8); ctx.stroke(); }
+}
+const STAKES = [{ x: 360 }, { x: 900 }];
+function drawStakes() {
+  for (const s of STAKES) {
+    ctx.fillStyle = css(shade(RGB.wood, 1.05)); ctx.fillRect(s.x - 3, SOIL_Y - 90, 6, 90);
+    ctx.fillStyle = css(shade(RGB.wood, 0.8)); ctx.fillRect(s.x + 1, SOIL_Y - 90, 2, 90);
+  }
+}
+const BASKET = { x: CONFIG.W - 96, y: SOIL_Y - 6, w: 130, h: 74 };
+function drawBasket() {
+  ctx.save(); ctx.translate(BASKET.x, BASKET.y);
+  // basket body first (woven look)
+  ctx.fillStyle = css(shade(RGB.wood, 1.0));
+  ctx.beginPath(); ctx.moveTo(-BASKET.w / 2, 0); ctx.lineTo(BASKET.w / 2, 0); ctx.lineTo(BASKET.w / 2 - 16, BASKET.h); ctx.lineTo(-BASKET.w / 2 + 16, BASKET.h); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = css(shade(RGB.wood, 0.7), 0.7); ctx.lineWidth = 2;
+  for (let i = 1; i < 5; i++) { const y = i / 5 * BASKET.h; const wx = BASKET.w / 2 - 16 * (y / BASKET.h); ctx.beginPath(); ctx.moveTo(-wx, y); ctx.lineTo(wx, y); ctx.stroke(); }
+  for (let i = -3; i <= 3; i++) { ctx.beginPath(); ctx.moveTo(i * 18, 2); ctx.lineTo(i * 14, BASKET.h - 2); ctx.stroke(); }
+  // collected produce mounded above the rim (drawn on top so it's visible)
+  ctx.save();
+  ctx.beginPath(); ctx.rect(-BASKET.w / 2 - 6, -70, BASKET.w + 12, 80); ctx.clip();
+  for (let i = 0; i < state.basket.length; i++) {
+    const it = state.basket[i];
+    ctx.save(); ctx.translate(it.jx, 2 - it.jy * 0.5); ctx.globalAlpha = clamp(it.fade, 0, 1);
+    drawBasketItem(it); ctx.restore();
+  }
+  ctx.restore();
+  // front rim over the produce so it looks nestled in
+  ctx.fillStyle = css(shade(RGB.wood, 1.2)); ctx.fillRect(-BASKET.w / 2 - 4, -4, BASKET.w + 8, 12);
+  ctx.strokeStyle = css(shade(RGB.wood, 0.7), 0.6); ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(-BASKET.w / 2 - 4, 0); ctx.lineTo(BASKET.w / 2 + 4, 0); ctx.stroke();
+  ctx.restore();
+}
+function drawBasketItem(it) {
+  const r = it.r * 0.9;
+  ctx.fillStyle = css(it.col);
+  if (it.kind === "pumpkin") { for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.ellipse(i * r * 0.3, 0, r * 0.5, r * 0.85, 0, 0, TAU); ctx.fill(); } }
+  else if (it.kind === "corn") { ctx.beginPath(); ctx.ellipse(0, 0, r * 0.6, r * 1.2, 0.3, 0, TAU); ctx.fill(); }
+  else if (it.kind === "pod") { ctx.strokeStyle = css(it.col); ctx.lineWidth = r; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(-r, 0); ctx.quadraticCurveTo(0, r * 1.4, r, 0); ctx.stroke(); }
+  else { ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill(); if (it.seeds) { ctx.fillStyle = css(RGB.sunflower); for (let i = 0; i < 4; i++) { const a = i * 1.4; ctx.beginPath(); ctx.arc(Math.cos(a) * r * 0.4, Math.sin(a) * r * 0.4, 0.9, 0, TAU); ctx.fill(); } } }
+}
+function drawFruits() {
+  for (const f of state.fruits) {
+    ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.rot);
+    const pk = { kind: f.kind, r: f.r, ripe: 1, grow: 1 };
+    // reuse the pickable renderer at scale 1
+    const tmp = ctx.fillStyle; drawPickable(0, 0, pk, 1, 0); ctx.fillStyle = tmp;
+    ctx.restore();
+  }
+}
+function drawParticles() {
+  for (const pt of state.particles) {
+    if (pt.kind === "puff") { ctx.fillStyle = css(pt.col || RGB.topsoil, clamp(pt.life, 0, 1) * 0.6); ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.r, 0, TAU); ctx.fill(); }
+    else if (pt.kind === "steam") { ctx.fillStyle = css(RGB.cloud, clamp(pt.life, 0, 1) * 0.3); ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.r, 0, TAU); ctx.fill(); }
+    else if (pt.kind === "petal") { ctx.save(); ctx.translate(pt.x, pt.y); ctx.rotate(pt.rot); ctx.fillStyle = css(pt.col, clamp(pt.life, 0, 1)); ctx.beginPath(); ctx.ellipse(0, 0, pt.r, pt.r * 0.5, 0, 0, TAU); ctx.fill(); ctx.restore(); }
+  }
+}
+function drawRain() {
+  ctx.strokeStyle = "rgba(180,205,220,0.6)"; ctx.lineWidth = 2; ctx.lineCap = "round";
+  for (const pt of state.particles) {
+    if (pt.kind === "rain") { ctx.beginPath(); ctx.moveTo(pt.x, pt.y); ctx.lineTo(pt.x - pt.vx * 0.02, pt.y - pt.len); ctx.stroke(); }
+  }
+}
+function drawPuddles() {
+  for (const p of state.puddles) { ctx.fillStyle = "rgba(150,180,195,0.4)"; ctx.beginPath(); ctx.ellipse(p.x, SOIL_Y + 4, p.r, p.r * 0.35, 0, 0, TAU); ctx.fill(); }
+}
+function drawBee(b) {
+  ctx.save(); ctx.translate(b.x, b.y);
+  const dir = Math.atan2(b.vy, b.vx);
+  if (b.butter) {
+    // butterfly: two flapping wings + slim body
+    const flap = Math.abs(Math.sin(b.wing));
+    ctx.rotate(dir);
+    ctx.fillStyle = css(RGB.strawberry, 0.9);
+    for (const sd of [-1, 1]) { ctx.save(); ctx.scale(1, sd); ctx.beginPath(); ctx.ellipse(-2, 6 + flap * 4, 7, 5 + flap * 3, -0.3, 0, TAU); ctx.ellipse(4, 4 + flap * 3, 5, 4 + flap * 2, 0.2, 0, TAU); ctx.fill(); ctx.restore(); }
+    ctx.fillStyle = css(shade(RGB.topsoil, 1.4)); ctx.beginPath(); ctx.ellipse(0, 0, 2, 6, 0, 0, TAU); ctx.fill();
+  } else {
+    // bee: striped body + blurred wings
+    const flap = Math.sin(b.wing) * 0.5 + 0.5;
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.beginPath(); ctx.ellipse(-2, -6, 7, 4 * (0.5 + flap), -0.4, 0, TAU); ctx.ellipse(2, -6, 7, 4 * (0.5 + flap), 0.4, 0, TAU); ctx.fill();
+    ctx.rotate(dir);
+    ctx.fillStyle = css(RGB.bee); ctx.beginPath(); ctx.ellipse(0, 0, 9, 6, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = "rgba(40,30,10,0.9)"; for (let i = -1; i <= 1; i++) { ctx.beginPath(); ctx.ellipse(i * 4, 0, 1.6, 6, 0, 0, TAU); ctx.fill(); }
+  }
+  ctx.restore();
+}
+function drawRainbow() {
+  if (state.rainbowT <= 0) return;
+  const a = clamp(state.rainbowT / CONFIG.rainbowSeconds, 0, 1) * (state.rainbowT < 1 ? state.rainbowT : 1);
+  const cols = ["#E06C75", "#E5A96B", "#E7D06B", "#7FB86B", "#6BA8C4", "#8C7FC4"];
+  ctx.save(); ctx.globalAlpha = a * 0.5; ctx.lineWidth = 10;
+  for (let i = 0; i < cols.length; i++) { ctx.strokeStyle = cols[i]; ctx.beginPath(); ctx.arc(CONFIG.W * 0.35, SOIL_Y, 320 - i * 11, Math.PI, TAU); ctx.stroke(); }
+  ctx.restore();
+}
+
+/* =========================================================================
+   MAIN UPDATE + DRAW
+   ========================================================================= */
+function update(dt) {
+  state.t += dt;
+  Audio.update(dt);
+
+  // sun pulse decays
+  state.sunPulse = Math.max(0, state.sunPulse - dt * 1.3);
+
+  // rain lifecycle
+  if (state.rainT > 0) {
+    state.rainT -= dt;
+    state.wetGround = Math.min(1, state.wetGround + dt * 0.5);
+    // spawn rain + occasional droplet ticks
+    for (let i = 0; i < 3; i++) raindrop();
+    if (Math.random() < 0.25) Audio.droplet();
+    if (state.rainT <= 0) { Audio.stopRain(); state.rainbowT = CONFIG.rainbowSeconds; }
+  } else {
+    state.wetGround = Math.max(0, state.wetGround - dt * 0.15);
+  }
+  if (state.rainbowT > 0) state.rainbowT -= dt;
+
+  // clouds drift with the wind
+  for (const c of state.clouds) { c.x += (c.spd + windAt(c.x) * 0.05) * dt; if (c.x > CONFIG.W + 200) c.x = -200; }
+  // rainy clouds leave once the rain is done
+  state.clouds = state.clouds.filter(c => !(c.rainy && state.rainT <= 0 && state.rainbowT < CONFIG.rainbowSeconds - 1) || !c.rainy).slice(0, 6);
+
+  // entities
+  for (const p of state.plants) updatePlant(p, dt);
+  state.plants = state.plants.filter(p => p.alive);
+  for (const f of state.fruits) updateFruit(f, dt);
+  state.fruits = state.fruits.filter(f => !f.dead && !(f.landed && f.land > 0.1));
+  for (const b of state.bees) updateBee(b, dt);
+  for (const w of state.worms) updateWorm(w, dt);
+  state.worms = state.worms.filter(w => { if (w.dead) { Audio; return false; } return true; });
+  for (const pt of state.particles) updateParticle(pt, dt);
+  state.particles = state.particles.filter(pt => !pt.dead);
+  // tunnels + puddles fade / soak in
+  for (const t of state.tunnels) t.life -= dt * 0.3; state.tunnels = state.tunnels.filter(t => t.life > 0);
+  for (const p of state.puddles) { p.r += dt * 6; p.life -= dt * (state.rainT > 0 ? 0.05 : 0.4); } state.puddles = state.puddles.filter(p => p.life > 0 && p.r < 40);
+  // basket item fade
+  for (const it of state.basket) { if (it.fadingOut) it.fade -= dt; }
+  state.basket = state.basket.filter(it => it.fade > 0);
+
+  // compost gently steams
+  if (Math.random() < 0.4) steam(COMPOST.x + (Math.random() - 0.5) * 60, COMPOST.y - 40);
+}
+
+function draw() {
+  // clear (letterbox bars stay black)
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, VW, VH);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, VW, VH);
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, offX * dpr, offY * dpr);
+  // clip to the logical stage
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, CONFIG.W, CONFIG.H); ctx.clip();
+
+  drawSky();
+  drawSun();
+  drawClouds();
+  drawHills();
+  drawSoil();
+  drawPuddles();
+  drawTunnels();
+  for (const w of state.worms) drawWorm(w);
+  // roots behind everything above ground
+  for (const p of state.plants) drawPlantBelow(p);
+  drawCompost();
+  drawStakes();
+  // above-ground plants
+  for (const p of state.plants) drawPlantAbove(p);
+  drawFruits();
+  for (const b of state.bees) drawBee(b);
+  // rain in front of plants
+  drawRain();
+  drawRainbow();
+  // foreground wooden frame + basket
+  drawBedFrame();
+  drawBasket();
+  drawParticles();
+
+  // sun-tap brightness flash over the whole scene
+  if (state.sunPulse > 0) { ctx.fillStyle = css(RGB.sun, state.sunPulse * 0.18); ctx.fillRect(0, 0, CONFIG.W, CONFIG.H); }
+
+  ctx.restore();
+}
+
+/* =========================================================================
+   INTERACTION — classify each pointer down and route it.
+   ========================================================================= */
+function bounce(p) { p.vScale += 6; }
+
+function tryHitPlant(lx, ly) {
+  // returns the nearest plant whose canopy/pickable/flower is within reach
+  let best = null, bestD = CONFIG.touchRadius;
+  for (const p of state.plants) {
+    if (p.p < 0.35) continue;
+    // nearest of: canopy disc, tip, any pickable, any flower
+    const c = plantWorldPoint(p, { x: p.geo.canopy.x, y: p.geo.canopy.y, h: 1 });
+    let d = Math.hypot(lx - c.x, ly - c.y) - p.geo.canopy.r;
+    const tp = plantWorldPoint(p, { x: p.geo.tip.x, y: p.geo.tip.y, h: 1 });
+    d = Math.min(d, Math.hypot(lx - tp.x, ly - tp.y));
+    for (const pk of p.geo.picks) { const w = plantWorldPoint(p, pk); d = Math.min(d, Math.hypot(lx - w.x, ly - w.y)); }
+    for (const fl of p.geo.flowers) { const w = plantWorldPoint(p, fl); d = Math.min(d, Math.hypot(lx - w.x, ly - w.y)); }
+    if (d < bestD) { bestD = d; best = p; }
+  }
+  return best;
+}
+
+function handleTap(lx, ly) {
+  // 1) sun
+  if (Math.hypot(lx - SUN.x, ly - SUN.y) < SUN.r + CONFIG.touchRadius * 0.6) {
+    state.sunPulse = 1;
+    for (const p of state.plants) p.sunLean = (SUN.x - p.x) > 0 ? 0.5 : -0.5;
+    return;
+  }
+  // 2) compost pile
+  if (Math.hypot(lx - COMPOST.x, ly - (COMPOST.y - 24)) < 80) {
+    for (let i = 0; i < 12; i++) puff(COMPOST.x + (Math.random() - 0.5) * 80, COMPOST.y - 30, RGB.subsoil, 1.2);
+    // volunteer sprouts pop up beside the pile
+    for (let i = 0; i < 3; i++) addPlant(COMPOST.x + 60 + i * 40 + Math.random() * 20, i * 0.2);
+    Audio.seedDrop();
+    return;
+  }
+  // 3) mature plant / flower
+  const p = tryHitPlant(lx, ly);
+  if (p) {
+    bounce(p);
+    // pop a ripe pickable into the basket, if any
+    let popped = false;
+    if (p.geo.picks.length) {
+      for (const pk of p.geo.picks) {
+        const fs = p.fruitState[pk.idx];
+        if ((!fs || fs.scale > 0.5) && pk.grow > 0.5 && pk.ripe > 0.4) {
+          const w = plantWorldPoint(p, pk);
+          if (pickFrom(p, pk, w)) { popped = true; break; }
+        }
+      }
+    }
+    // sunflower: release a few petals for delight (nothing to basket)
+    if (!popped && p.type === "sunflower" && p.p >= 1) {
+      const c = plantWorldPoint(p, { x: p.geo.canopy.x, y: p.geo.canopy.y, h: 1 });
+      for (let i = 0; i < 5; i++) petal(c.x, c.y, RGB.sunflower);
+      Audio.pop();
+    }
+    // if it has open flowers, invite a pollinator
+    if (p.geo.flowers.length && state.bees.length < CONFIG.maxBees && Math.random() < 0.9) {
+      const fl = p.geo.flowers[0], w = plantWorldPoint(p, fl);
+      addBee(w.x - 60, w.y - 40);
+    }
+    return;
+  }
+  // 4) sky (above the soil, not on the sun) -> rain
+  if (ly < SOIL_Y - 55) { startRain(lx); return; }
+  // 5) soil surface -> plant a seed
+  if (ly >= SOIL_Y - 55 && ly <= SOIL_Y + 40) {
+    Audio.seedDrop();
+    // little seed-bounce puff at the surface
+    for (let i = 0; i < 5; i++) puff(lx, SOIL_Y - 2, RGB.topsoil, 0.8);
+    addPlant(lx, 0);
+    return;
+  }
+  // 6) below the soil line -> a worm surfaces
+  const w = addWorm(true, lx); if (w) { w.y = SOIL_Y + 30; }
+}
+
+/* ---- pointer plumbing: up to 5 pointers, drag = plant a row ---- */
+const pointers = new Map();   // id -> {lastPlantX, lastX, lastY, dragged, dragAcc}
+function onDown(e) {
+  Audio.unlock();
+  const lp = screenToLogical(e.clientX, e.clientY);
+  pointers.set(e.pointerId, { lastX: lp.x, lastY: lp.y, dragged: false, dragDist: 0, onSurface: (lp.y >= SOIL_Y - 55 && lp.y <= SOIL_Y + 40) });
+  // defer the tap action to pointerup unless it's clearly a surface drag start;
+  // simplest robust behavior: act on down, and let drag add extra plants.
+  handleTap(lp.x, lp.y);
+}
+function onMove(e) {
+  const st = pointers.get(e.pointerId); if (!st) return;
+  const lp = screenToLogical(e.clientX, e.clientY);
+  const dx = lp.x - st.lastX, dy = lp.y - st.lastY;
+  const dist = Math.hypot(dx, dy);
+  st.dragDist += dist;
+  // dragging along the soil surface plants a staggered row; interpolate
+  // between samples so a fast drag (few events) doesn't leave gaps
+  if (st.onSurface && lp.y >= SOIL_Y - 60 && lp.y <= SOIL_Y + 45) {
+    const spacing = 90;                          // one plant per ~90px of drag
+    st.dragAcc = (st.dragAcc || 0) + dist;
+    let n = 0;
+    while (st.dragAcc >= spacing) {
+      st.dragAcc -= spacing;
+      const t = dist > 0 ? clamp((dist - st.dragAcc) / dist, 0, 1) : 1;
+      const px = lerp(st.lastX, lp.x, t);
+      if (state.plants.length < CONFIG.maxPlants + 4) {
+        Audio.seedDrop();
+        for (let i = 0; i < 3; i++) puff(px, SOIL_Y - 2, RGB.topsoil, 0.7);
+        addPlant(px, 0.1 + n * 0.12);            // each sprouts a beat after the last
+        n++;
+      }
+    }
+  }
+  st.lastX = lp.x; st.lastY = lp.y;
+}
+function onUp(e) { pointers.delete(e.pointerId); }
+
+canvas.addEventListener("pointerdown", onDown);
+canvas.addEventListener("pointermove", onMove);
+canvas.addEventListener("pointerup", onUp);
+canvas.addEventListener("pointercancel", onUp);
+
+// kiosk hardening: no context menu, no gesture zoom, no scrolling
+document.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("gesturestart", e => e.preventDefault());
+document.addEventListener("dblclick", e => e.preventDefault());
+window.addEventListener("touchmove", e => e.preventDefault(), { passive: false });
+
+/* =========================================================================
+   LOOP — fixed-timestep accumulator; pause when tab is hidden.
+   ========================================================================= */
+let last = performance.now(), acc = 0, paused = false;
+document.addEventListener("visibilitychange", () => { paused = document.hidden; last = performance.now(); });
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (paused) { last = now; return; }
+  let dt = (now - last) / 1000; last = now;
+  if (dt > CONFIG.maxFrameDt) dt = CONFIG.maxFrameDt;
+  acc += dt;
+  while (acc >= CONFIG.fixedStep) { update(CONFIG.fixedStep); acc -= CONFIG.fixedStep; }
+  draw();
+}
+requestAnimationFrame(frame);
+
+// register the shared service worker so the toy works fully offline
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+  window.addEventListener("load", () => { navigator.serviceWorker.register("sw.js").catch(() => {}); });
+}
+</script>
+</body>
+</html>

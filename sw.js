@@ -1,11 +1,12 @@
 /* Minimal cache-first service worker so Chicken Yard runs fully offline
    once it has been opened (or installed to the home screen) at least once. */
-const CACHE = "barnyard-v2";
+const CACHE = "barnyard-v3";
 const ASSETS = [
   "./",
   "./index.html",
   "./chicken-yard.html",
   "./duck-pond.html",
+  "./garden.html",
   "./manifest.webmanifest",
   "./icon-192.png",
   "./icon-512.png",
