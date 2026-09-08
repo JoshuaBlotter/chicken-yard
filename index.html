@@ -71,6 +71,16 @@
     a.card { flex: 0 0 auto; width: min(74vw, 34vh); min-width: 0; max-width: 320px; border-width: 4px; }
     a.card .label { padding: 1.6vmin; font-size: clamp(15px, 3.4vmin, 24px); }
   }
+  /* Landscape phones (short viewport): keep all three in ONE row and size by
+     height so nothing wraps or gets clipped. Scoped to max-height:500px so
+     desktop and tablet landscape keep the roomier default layout. */
+  @media (orientation: landscape) and (max-height: 500px) {
+    body { justify-content: center; gap: 2vh; padding: 2.5vh 3vw; }
+    h1 { font-size: clamp(15px, 5.5vh, 30px); }
+    .cards { flex-wrap: nowrap; gap: 2.5vw; }
+    a.card { flex: 1 1 0; min-width: 0; max-width: 58vh; border-width: 4px; }
+    a.card .label { padding: 0.8vh; font-size: clamp(13px, 4.2vh, 22px); }
+  }
 </style>
 </head>
 <body>
